@@ -1015,6 +1015,11 @@ fn viewer_eye(pos: Vec3, eye: Vec3, collision: &sekiro_formats::hknp::CollisionM
     }
 }
 
+/// Setup another crate adds to the `--map` app (a game library on top of the map): the first
+/// runs before `DefaultPlugins` (asset sources), the second after the map's own plugins.
+pub static APP_HOOKS: std::sync::OnceLock<(fn(&mut App), fn(&mut App))> =
+    std::sync::OnceLock::new();
+
 pub fn run(options: Options) -> Result<()> {
     let dir = map_dir(&options.cache, &options.id)?;
 
@@ -1032,6 +1037,9 @@ pub fn run(options: Options) -> Result<()> {
 
     raise_io_stack();
     let mut app = App::new();
+    if let Some((before, _)) = APP_HOOKS.get() {
+        before(&mut app);
+    }
     app.add_plugins((
         DefaultPlugins
             .set(crate::vram::render_plugin())
@@ -1123,6 +1131,9 @@ pub fn run(options: Options) -> Result<()> {
     }
     ready::install(&mut app);
     app.add_plugins(crate::presentation::PresentationPlugin);
+    if let Some((_, after)) = APP_HOOKS.get() {
+        after(&mut app);
+    }
     app.run();
     Ok(())
 }
