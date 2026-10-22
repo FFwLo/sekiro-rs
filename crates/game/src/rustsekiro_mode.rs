@@ -231,6 +231,11 @@ fn after(app: &mut App) {
         };
         let _ = BLOCKS.set(blocks.clone());
         let _ = IDOLS.set(idols(&layouts, &world));
+        // The game's navmesh for the enemies' paths and mesh queries (rustsekiro::navmesh).
+        let t1 = std::time::Instant::now();
+        let nav = rustsekiro::navmesh::load(&cache, &layouts);
+        info!("rustsekiro: navmesh, {} polygons, {:.1} s", nav.polygon_count(), t1.elapsed().as_secs_f32());
+        rustsekiro::navmesh::install(Some(nav));
         Ok((world, blocks, warp))
     })();
     // Wolf's start: the idol's warp point, else the camera's spot (its floor below).
