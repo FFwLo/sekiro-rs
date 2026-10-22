@@ -163,6 +163,86 @@ pub(crate) struct Block {
     collisions: Vec<Surface>,
     retire_frames: u8,
     detail: BTreeMap<String, [bool; 3]>,
+    /// The block's part entities are spawned and its GLBs held ([`residency`]).
+    loaded: bool,
+    /// Seconds left before a loaded block nobody wants is unloaded.
+    unload_in: Option<f32>,
+}
+
+/// WorldBackRead's "Hit" set (`docs/MAP-COMPLETENESS.md`, section 3): a block within this
+/// distance of the player loads, and a loaded one stays until he is past the end distance.
+const LOAD_DISTANCE: f32 = 80.0;
+const KEEP_DISTANCE: f32 = 90.0;
+/// A record whose demand is gone retires and is removed after this long, unless demand
+/// returns first (`0x14081eae0`).
+const RETIRE_SECS: f32 = 3.0;
+
+impl Block {
+    /// Horizontal distance from `point` to the nearest of the block's collision parts.
+    fn distance(&self, point: Vec3) -> f32 {
+        let p = point.xz();
+        self.collisions
+            .iter()
+            .map(|s| p.distance(p.clamp(s.min, s.max)))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    fn demanded(&self) -> bool {
+        self.normal != [0; 8] || self.additional != [0; 8]
+    }
+
+    /// Whether the block's assets should be in memory: it is demanded, or one of `points`
+    /// is within the load distance (the keep distance once loaded).
+    fn wanted(&self, points: &[Vec3]) -> bool {
+        let reach = if self.loaded {
+            KEEP_DISTANCE
+        } else {
+            LOAD_DISTANCE
+        };
+        self.demanded() || points.iter().any(|&p| self.distance(p) <= reach)
+    }
+
+    /// Forget the block's assets after its parts were despawned, returning the GLB handles
+    /// it held so the stream drops them too.
+    fn unload(&mut self) -> std::collections::HashSet<bevy::asset::UntypedAssetId> {
+        self.loaded = false;
+        self.unload_in = None;
+        self.assets_ready = false;
+        self.glb_total = 0;
+        self.handles.drain(..).map(|h| h.id().untyped()).collect()
+    }
+}
+
+impl MapWorld {
+    /// Advance each block's residency by `dt` seconds with the focus at `points`: the blocks
+    /// to load now, and those nobody wanted for [`RETIRE_SECS`] to unload (only once
+    /// `may_unload`). Wanting a retiring block again keeps it.
+    fn plan_residency(
+        &mut self,
+        points: &[Vec3],
+        dt: f32,
+        may_unload: bool,
+    ) -> (BTreeSet<String>, Vec<String>) {
+        let mut load = BTreeSet::new();
+        let mut unload = Vec::new();
+        for block in self.blocks.values_mut() {
+            match (block.loaded, block.wanted(points)) {
+                (false, true) => {
+                    load.insert(block.id.clone());
+                }
+                (true, true) => block.unload_in = None,
+                (true, false) if may_unload => {
+                    let left = block.unload_in.unwrap_or(RETIRE_SECS) - dt;
+                    block.unload_in = Some(left);
+                    if left <= 0. {
+                        unload.push(block.id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (load, unload)
+    }
 }
 
 struct Surface {
@@ -603,6 +683,8 @@ impl MapWorld {
                     warm_mask: [0; 8],
                     retire_frames: 0,
                     detail,
+                    loaded: false,
+                    unload_in: None,
                 },
             );
         }
@@ -870,14 +952,14 @@ pub(crate) fn update(
     }
     for block in world.blocks.values_mut() {
         // Streaming requests a block's GLBs over time; it is ready once every one has loaded.
-        block.assets_ready = block.assets_ready
-            || (block.handles.len() >= block.glb_total
-                && block
-                    .handles
-                    .iter()
-                    .all(|h| assets.is_loaded_with_dependencies(h.id())));
-        let demanded = block.normal != [0; 8] || block.additional != [0; 8];
-        let next = if demanded {
+        block.assets_ready = block.loaded
+            && (block.assets_ready
+                || (block.handles.len() >= block.glb_total
+                    && block
+                        .handles
+                        .iter()
+                        .all(|h| assets.is_loaded_with_dependencies(h.id()))));
+        let next = if block.demanded() {
             block.retire_frames = 0;
             if block.assets_ready {
                 RequestState::Ready
@@ -900,6 +982,82 @@ pub(crate) fn update(
             );
             block.state = next;
         }
+    }
+}
+
+/// A block's part entities were despawned and its handles dropped, for the caches that keep
+/// per-block data (grass bakes, static batch singles).
+#[derive(Message)]
+pub(crate) struct BlockUnloaded(pub(crate) String);
+
+/// The blocks to spawn at the start: those within [`LOAD_DISTANCE`] of `focus`, or all of them
+/// for fixed captures, a start without a focus, or groups switched off.
+pub(crate) fn startup_blocks(world: &MapWorld, scene: &super::MapScene) -> BTreeSet<String> {
+    world
+        .blocks
+        .values()
+        .filter(|b| {
+            world.capture_views.is_some()
+                || scene.groups == GroupMode::Off
+                || scene.focus.is_none_or(|f| b.distance(f) <= LOAD_DISTANCE)
+        })
+        .map(|b| b.id.clone())
+        .collect()
+}
+
+/// Asset residency, apart from visibility: a block is wanted while demanded or near the
+/// [`MapFocus`] ([`Block::wanted`]). A wanted block that is not loaded spawns its parts
+/// nearest-first; a loaded block nobody wants for [`RETIRE_SECS`] despawns them and drops its
+/// GLBs, and Bevy frees their meshes, textures and materials. Collision stays (one world).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn residency(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    time: Res<Time>,
+    mut world: ResMut<MapWorld>,
+    layout: Res<super::Layout>,
+    groups: Res<super::Groups>,
+    mut pending: ResMut<Pending>,
+    focus: Query<&Transform, With<MapFocus>>,
+    parts: Query<(Entity, &BlockPart)>,
+    mut unloaded: MessageWriter<BlockUnloaded>,
+) {
+    // Fixed captures and the all-groups debug view keep every block; a block never unloads
+    // while the first load is still counting its instances.
+    if world.capture_views.is_some() || groups.mode == GroupMode::Off {
+        return;
+    }
+    let points: Vec<_> = focus.iter().map(|t| t.translation).collect();
+    let (load, unload) = world.plan_residency(&points, time.delta_secs(), pending.loaded());
+    if !load.is_empty() {
+        info!("blocks loading: {load:?}");
+        spawn(
+            &mut commands,
+            &assets,
+            &mut world,
+            &layout.scene,
+            &mut pending,
+            &load,
+            points.first().copied(),
+        );
+    }
+    for id in unload {
+        let roots: Vec<_> = parts
+            .iter()
+            .filter(|(_, p)| p.block == id)
+            .map(|(e, _)| e)
+            .collect();
+        for &root in &roots {
+            commands.entity(root).despawn();
+        }
+        let handles = world.blocks.get_mut(&id).expect("listed block").unload();
+        pending.release(&id, &handles);
+        info!(
+            "block {id} unloaded: {} parts, {} GLBs",
+            roots.len(),
+            handles.len()
+        );
+        unloaded.write(BlockUnloaded(id));
     }
 }
 
@@ -982,10 +1140,11 @@ pub(crate) fn publish(
     }
 }
 
-/// Instantiate eligible canonical rows once; geometry stays warm while its request
-/// state changes. Jobs C/E/F attach state through BlockPart without duplicate roots.
+/// Instantiate the eligible canonical rows of `blocks` once each time they load; geometry
+/// stays warm while its request state changes. Jobs C/E/F attach state through BlockPart
+/// without duplicate roots.
 ///
-/// Interactive worlds queue each row's GLB nearest-first from `scene.focus` and stream them
+/// Interactive worlds queue each row's GLB nearest-first from `focus` and stream them
 /// ([`super::stream_assets`]); a MapPiece instantiates only the level of detail it shows at
 /// the start, and [`update_detail`] adds another level the first time it is selected.
 /// Fixed captures (`capture_views`) keep loading every level at once.
@@ -995,7 +1154,12 @@ pub(crate) fn spawn(
     world: &mut MapWorld,
     scene: &super::MapScene,
     pending: &mut Pending,
+    blocks: &BTreeSet<String>,
+    focus: Option<Vec3>,
 ) {
+    for id in blocks {
+        world.blocks.get_mut(id).expect("listed block").loaded = true;
+    }
     if scene.no_pieces {
         return;
     }
@@ -1005,7 +1169,7 @@ pub(crate) fn spawn(
     let only_part = crate::arg_value(&args, "--world-part");
     // Nearest first across every block, so the stream loads outwards from the start.
     let mut order = Vec::new();
-    for (id, block) in &world.blocks {
+    for (id, block) in world.blocks.iter().filter(|(id, _)| blocks.contains(*id)) {
         for (index, row) in block.json["parts"]
             .as_array()
             .into_iter()
@@ -1015,7 +1179,7 @@ pub(crate) fn spawn(
             let Some(transform) = super::row_transform(row) else {
                 continue;
             };
-            let distance = match (scene.focus, row["model"].as_str()) {
+            let distance = match (focus, row["model"].as_str()) {
                 (Some(focus), Some(model)) => {
                     super::placed_distance(&block.json["models"][model], focus, &transform)
                 }
@@ -1164,7 +1328,7 @@ pub(crate) fn spawn(
             };
             // The level the first update selects; capture views and the file-order fallback
             // keep the first available level.
-            let initial = match scene.focus {
+            let initial = match focus {
                 Some(focus) if capture_handle.is_none() => {
                     let distance = super::lod::bounds_distance(focus, &transform, min, max);
                     let weights = super::lod::LodState::default()
@@ -1229,7 +1393,7 @@ pub(crate) fn spawn(
         }
         spawned += 1;
     }
-    for block in world.blocks.values_mut() {
+    for block in world.blocks.values_mut().filter(|b| blocks.contains(&b.id)) {
         block.glb_total = seen.get(&block.id).map_or(0, BTreeSet::len);
         info!(
             "{} warm models {}, skipped render reasons {:?}",
@@ -2570,5 +2734,81 @@ mod tests {
             w.most, w.backwards, w.kink
         );
         assert!(w.most > 0.1 && w.kink > 0.1, "h's treads are steps");
+    }
+
+    #[test]
+    fn a_block_left_behind_unloads_after_three_seconds_unless_wanted_again() {
+        let cache = sekiro_sim::cache::root();
+        if !cache.join("maps/m11_01_00_00/layout.json").is_file() {
+            return;
+        }
+        let mut world = MapWorld::load(&cache, ASHINA[0], "maps/m11_00_00_00/").unwrap();
+        for block in world.blocks.values_mut() {
+            block.loaded = true;
+        }
+        // On m11_00's ledge part; nothing is demanded, so distance alone decides.
+        let here = Vec3::new(-136.5, -42.54, -118.0);
+        assert_eq!(world.blocks[ASHINA[0]].distance(here), 0.0);
+        let far: Vec<_> = world
+            .blocks
+            .values()
+            .filter(|b| b.distance(here) > KEEP_DISTANCE)
+            .map(|b| b.id.clone())
+            .collect();
+        assert!(!far.is_empty(), "every block is near the ledge");
+        let target = far[0].clone();
+        let surface = &world.blocks[&target].collisions[0];
+        let beside = ((surface.min + surface.max) / 2.).extend(0.).xzy();
+
+        // Not while the first load is still counting its instances.
+        let (load, unload) = world.plan_residency(&[here], 10., false);
+        assert!(load.is_empty() && unload.is_empty());
+        // Just under the retirement interval nothing goes.
+        let (_, unload) = world.plan_residency(&[here], 2.9, true);
+        assert!(unload.is_empty(), "{unload:?}");
+        // Wanted again (the player comes back beside it): the interval starts over.
+        world.plan_residency(&[here, beside], 0.1, true);
+        let (_, unload) = world.plan_residency(&[here], 2.9, true);
+        assert!(!unload.contains(&target), "{unload:?}");
+        // Past three seconds unwanted, it unloads; the block under the player never does.
+        let (_, unload) = world.plan_residency(&[here], 0.2, true);
+        assert!(unload.contains(&target) && !unload.contains(&ASHINA[0].to_string()));
+        world.blocks.get_mut(&target).unwrap().unload();
+        // Coming back loads it again.
+        let (load, _) = world.plan_residency(&[beside], 0.1, true);
+        assert!(load.contains(&target), "{load:?}");
+    }
+
+    #[test]
+    fn an_unloaded_blocks_stream_is_dropped_and_queues_afresh() {
+        let mut ecs = World::new();
+        let [a, b, c] = [(); 3].map(|_| ecs.spawn_empty().id());
+        let mut meshes = Assets::<Mesh>::default();
+        let handles: Vec<_> = (0..2)
+            .map(|_| meshes.add(Cuboid::default()).untyped())
+            .collect();
+        let mut pending = Pending::default();
+        pending.queue("a/one.glb", Some("a"), true, (a, 0));
+        pending.queue("a/two.glb", Some("a"), true, (b, 0));
+        pending.queue("b/one.glb", Some("b"), true, (c, 0));
+        // The stream has requested a's first GLB.
+        pending.next = 1;
+        pending.handles.push(handles[0].clone());
+        pending.in_flight.push(handles[0].clone());
+        pending.handles.push(handles[1].clone());
+
+        pending.release("a", &[handles[0].id()].into_iter().collect());
+        assert!(pending.stream[..2].iter().all(|r| r.targets.is_empty()));
+        assert_eq!(pending.stream[2].targets, vec![(c, 0)]);
+        assert!(pending.in_flight.is_empty());
+        assert_eq!(
+            pending.handles.len(),
+            1,
+            "only the other block's handle stays"
+        );
+        // Loading the block again starts a new request at the end of the stream.
+        let index = pending.queue("a/one.glb", Some("a"), true, (a, 0));
+        assert_eq!(index, 3);
+        assert!(pending.requested(index).is_none());
     }
 }

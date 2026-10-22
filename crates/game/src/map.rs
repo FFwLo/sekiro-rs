@@ -388,6 +388,26 @@ impl Pending {
         })
     }
 
+    /// Forget `block`'s GLBs after its parts were despawned: their requests lose their targets
+    /// (the stream skips any it has not reached), the next [`Self::queue`] of the same GLB
+    /// starts a new request, and the GLB handles in `handles` are dropped.
+    pub(crate) fn release(
+        &mut self,
+        block: &str,
+        handles: &std::collections::HashSet<UntypedAssetId>,
+    ) {
+        for (index, request) in self.stream.iter_mut().enumerate() {
+            if request.block.as_deref() == Some(block) {
+                request.targets.clear();
+                if self.stream_index.get(&request.glb) == Some(&index) {
+                    self.stream_index.remove(&request.glb);
+                }
+            }
+        }
+        self.handles.retain(|h| !handles.contains(&h.id()));
+        self.in_flight.retain(|h| !handles.contains(&h.id()));
+    }
+
     /// Requested GLBs that have not finished, with their textures.
     pub fn streaming(&self) -> usize {
         self.stream.len() - self.next + self.in_flight.len()
@@ -453,6 +473,10 @@ fn stream_assets(
         let index = pending.next;
         pending.next += 1;
         let request = &pending.stream[index];
+        // Its block unloaded before the stream reached it.
+        if request.targets.is_empty() {
+            continue;
+        }
         let handle: Handle<Gltf> = load_map_asset(&assets, request.glb.clone(), request.unapproved);
         for &(entity, level) in &request.targets {
             commands.entity(entity).insert(WorldAssetRoot(scene_handle(
@@ -743,9 +767,10 @@ pub fn add_map(
         stage("connected world and story");
         app.add_plugins(visibility::MapVisibilityPlugin)
             .insert_resource(world)
+            .add_message::<world::BlockUnloaded>()
             .add_systems(
                 Update,
-                (world::update, world::update_detail)
+                (world::update, world::residency, world::update_detail)
                     .chain()
                     .after(track_loading)
                     .after(apply_groups),
@@ -1248,7 +1273,16 @@ fn spawn_map(
     let scene = &layout.scene;
     let far_enabled = !std::env::args().any(|a| a == "--no-far-scenery");
     if let Some(mut connected) = connected {
-        world::spawn(&mut commands, &assets, &mut connected, scene, &mut pending);
+        let blocks = world::startup_blocks(&connected, scene);
+        world::spawn(
+            &mut commands,
+            &assets,
+            &mut connected,
+            scene,
+            &mut pending,
+            &blocks,
+            scene.focus,
+        );
     } else if !scene.no_pieces {
         let models = &layout.json["models"];
         let mut spawned = 0;

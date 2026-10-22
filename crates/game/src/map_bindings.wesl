@@ -15,6 +15,9 @@ struct MapLight {
     hemi_axis: vec4<f32>,
     hemi_delta: vec4<f32>,
 }
+// The same values unsized: a bindless slot freed with its last material is bound to Bevy's
+// 16-byte fallback buffer, which a fixed-size `MapLight` (240 bytes) would fail validation on.
+struct MapLightWords { v: array<vec4<f32>>, }
 @if(BINDLESS) {
     struct LayerIndices {
         layers: u32,
@@ -50,7 +53,7 @@ struct MapLight {
         light: u32,
     }
     @group(constants::MATERIAL_BIND_GROUP) @binding(102) var<storage, read> giiv_buffers: binding_array<GiivBuffer>;
-    @group(constants::MATERIAL_BIND_GROUP) @binding(103) var<storage, read> light_buffers: binding_array<MapLight>;
+    @group(constants::MATERIAL_BIND_GROUP) @binding(103) var<storage, read> light_buffers: binding_array<MapLightWords>;
     @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<storage> layer_indices: array<LayerIndices>;
     @group(constants::MATERIAL_BIND_GROUP) @binding(101) var<storage> layer_array: array<Layers>;
 }

@@ -141,7 +141,8 @@ pub(crate) fn install(app: &mut App, dir: &Path, prefix: &str) -> Result<()> {
         });
     }
     app.insert_resource(grass)
-        .add_systems(PreUpdate, instantiate)
+        .add_message::<crate::map::world::BlockUnloaded>()
+        .add_systems(PreUpdate, (release, instantiate).chain())
         .add_systems(PostUpdate, enforce_shadow_flags);
     Ok(())
 }
@@ -268,6 +269,22 @@ fn instantiate(world: &mut World, mut roots: Local<Unattached>) {
         world.entity_mut(parent).insert(GrassAttached);
     }
     world.insert_resource(grass);
+}
+
+/// Drops an unloaded block's baked clumps. Its part roots, with the clumps and loading
+/// barriers under them, are already despawned; the bake repeats when it loads again.
+fn release(
+    mut unloaded: MessageReader<crate::map::world::BlockUnloaded>,
+    mut grass: ResMut<Grass>,
+) {
+    for crate::map::world::BlockUnloaded(id) in unloaded.read() {
+        if let Some(block) = grass.blocks.iter_mut().find(|b| &b.id == id) {
+            block.merged.clear();
+            for prototype in block.prototypes.values_mut() {
+                prototype.barrier = None;
+            }
+        }
+    }
 }
 
 /// Spawns the clumps bound to `part_index` under `parent`, or returns false while a

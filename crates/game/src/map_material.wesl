@@ -132,9 +132,20 @@ fn gi_word(slot: u32, index: u32) -> u32 {
     return giiv_buffer.words[index];
 }
 
+@if(BINDLESS)
+fn bindless_light(index: u32) -> MapLight {
+    var light: MapLight;
+    for (var i = 0u; i < 13u; i++) {
+        light.direct[i] = light_buffers[index].v[i];
+    }
+    light.hemi_axis = light_buffers[index].v[13u];
+    light.hemi_delta = light_buffers[index].v[14u];
+    return light;
+}
+
 fn light_values(slot: u32) -> MapLight {
 @if(BINDLESS)
-    return light_buffers[layer_indices[slot].light];
+    return bindless_light(layer_indices[slot].light);
 @if(!BINDLESS)
     return map_light;
 }
