@@ -618,16 +618,18 @@ fn emit_point(c: &Config, t: f32, rnd: &mut Rnd, frame: Quat) -> (Vec3, Vec3) {
         }
         _ => (Vec3::ZERO, Vec3::Z),
     };
-    // InitialDirection: 0 by shape, 1 / 4 up, 2 / 5 down, 3 forward, 6 world up (the 6 was
-    // read from the data: see docs/MAP-FX.md, flame height).
-    // 6 is world up: the torch and brazier sparks (gravity -1, a 5.6 degree cone, no node
-    // rotation) and flame cores of the common effects only rise if it is, wherever the node
-    // is tilted.
+    // InitialDirection (reference/fxr, as FwLo's RustSekiro reads it): 0 by shape, 1 / 2 global
+    // up / down, 3 global north, 4 / 5 local up / down, 6 local north (the node's +Z). The
+    // particle direction is in the node's frame, so a global axis is turned back by its rotation.
+    // 6 was world up until #60: the Outskirts blowing snow 839542 / 839543 (8.3 m/s along the
+    // region's yaw) then shot straight up, and every 6-driven fog bank rose instead of drifting.
     let base = match dirmode {
-        1 | 4 => Vec3::Y,
-        2 | 5 => Vec3::NEG_Y,
-        6 => frame.inverse() * Vec3::Y,
-        3 => Vec3::Z,
+        1 => frame.inverse() * Vec3::Y,
+        2 => frame.inverse() * Vec3::NEG_Y,
+        3 => frame.inverse() * Vec3::Z,
+        4 => Vec3::Y,
+        5 => Vec3::NEG_Y,
+        6 => Vec3::Z,
         _ => outward,
     };
     let sp = &c.direction_spread;
@@ -771,12 +773,17 @@ fn weather(n: &mut NodeInst, a: &Action, dt: f32, alive: bool, previous: Vec3) {
         seed: n.seed.wrapping_add(n.emissions as u32),
         k: 0,
     };
+    let interval = int(a, Field::EmissionIntervalMin, 0).max(1) as f32 / 30.;
+    let authored = int(a, Field::EmissionParticleCount, 0).max(0) as usize;
+    let thinning = pool_thinning(a, authored, interval);
     let mut guard = 0;
     while alive && n.emit_next <= n.time && guard < 4 {
-        let count = int(a, Field::EmissionParticleCount, 0).max(0) as usize;
+        // The authored count, thinned evenly over emissions when the pool cannot hold it.
+        let quota = |k: i64| (k as f64 * authored as f64 * thinning).floor() as usize;
+        let count = quota(n.emissions + 1) - quota(n.emissions);
         let size = game_vec(prop(a.get(Field::EmitterSize), 0., &mut rnd, [1.; 4]));
         let rotation = game_rot(prop(a.get(Field::EmitterRotation), 0., &mut rnd, [0.; 4]));
-        for i in 0..count.min(2048usize.saturating_sub(n.particles.len())) {
+        for i in 0..count.min(WEATHER_POOL.saturating_sub(n.particles.len())) {
             let seed = n
                 .seed
                 .wrapping_add((n.emissions as u32).wrapping_mul(4001))
@@ -806,9 +813,27 @@ fn weather(n: &mut NodeInst, a: &Action, dt: f32, alive: bool, previous: Vec3) {
             });
         }
         n.emissions += 1;
-        let interval = int(a, Field::EmissionIntervalMin, 0).max(1) as f32 / 30.;
         n.emit_next += interval;
         guard += 1;
+    }
+}
+
+/// Particles one GPUStandardParticle node keeps on the CPU.
+const WEATHER_POOL: usize = 2048;
+
+/// The fraction of each emission to keep so the steady population (count per emission times
+/// emissions per lifetime) fits [`WEATHER_POOL`]. Without it a dense emitter fills the pool in
+/// its first second and then emits nothing until that batch expires together, so the effect
+/// arrives in waves (camera snow 839500: 40 per 1/30 s for 6 s, 7200 wanted, #84).
+fn pool_thinning(a: &Action, count: usize, interval: f32) -> f64 {
+    let mut rnd = Rnd { seed: 0, k: 0 };
+    let life = int(a, Field::ParticleDuration, 30).max(1) as f32 / 30.
+        * scalar(a, Field::ParticleDurationMultiplier, 0., &mut rnd, 1.).max(0.);
+    let steady = count as f64 * (f64::from(life) / f64::from(interval)).ceil();
+    if steady > WEATHER_POOL as f64 {
+        WEATHER_POOL as f64 / steady
+    } else {
+        1.
     }
 }
 
@@ -1316,5 +1341,97 @@ mod tests {
             );
         }
         assert!(n.finished && n.particles.is_empty());
+    }
+
+    /// #84: the installed camera snow (839500) keeps falling around a camera that runs at
+    /// Wolf's 6 m/s. It used to fill its 2048-particle pool in 1.7 s, then emit nothing until
+    /// that batch expired at 6 s, leaving 2 s in every 6 with no flake within 5 m.
+    #[test]
+    fn camera_snow_falls_steadily_around_a_running_camera() {
+        fn near(n: &NodeInst, at: Vec3, out: &mut usize) {
+            *out += n
+                .particles
+                .iter()
+                .filter(|p| (p.pos - at).xz().length() < 5.)
+                .count();
+            for c in &n.children {
+                near(c, at, out);
+            }
+        }
+        let mut lib = FxrLib::scan(&sekiro_sim::cache::root());
+        let def = lib.compiled(839500).expect("camera snow 839500 installed");
+        let mut n = make_node(&mut lib, &def, 1, 0).unwrap();
+        let dt = 1. / 60.;
+        let mut counts = Vec::new();
+        for f in 0..60 * 20 {
+            let at = Vec3::new(6. * f as f32 * dt, 1.6, 0.);
+            step_node(&mut n, &mut lib, Transform::from_translation(at), dt, false);
+            if f >= 60 * 8 && f % 6 == 0 {
+                let mut c = 0;
+                near(&n, at, &mut c);
+                counts.push(c);
+            }
+        }
+        let mean = counts.iter().sum::<usize>() as f32 / counts.len() as f32;
+        let (min, max) = (counts.iter().min().unwrap(), counts.iter().max().unwrap());
+        assert!(mean > 50., "mean {mean}");
+        assert!(
+            *min as f32 > 0.6 * mean && (*max as f32) < 1.4 * mean,
+            "near counts {min}..{max}, mean {mean}"
+        );
+    }
+
+    /// #60: InitialDirection 6 is the node's local +Z and 1 is world up, whatever the node's
+    /// turn. A node yawed 90 degrees and pitched sends its 6 along its own Z and its 1 straight up.
+    #[test]
+    fn initial_direction_six_is_local_north_and_one_is_global_up() {
+        let mut rnd = Rnd { seed: 3, k: 0 };
+        let frame = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2) * Quat::from_rotation_x(0.3);
+        let world = |dir: i64, rnd: &mut Rnd| {
+            let tree = json!({"type":2200,"configs":[{"appearance":{"type":603},
+                "emitterShape":{"type":400,"direction":dir}}],"nodes":[]});
+            let node = NodeDef::new(&tree);
+            let c = node.cfg.as_ref().unwrap();
+            frame * emit_point(c, 0.0, rnd, frame).1
+        };
+        assert!(world(6, &mut rnd).distance(frame * Vec3::Z) < 1e-5);
+        assert!(world(1, &mut rnd).distance(Vec3::Y) < 1e-5);
+        assert!(world(2, &mut rnd).distance(Vec3::NEG_Y) < 1e-5);
+        assert!(world(3, &mut rnd).distance(Vec3::Z) < 1e-5);
+        assert!(world(4, &mut rnd).distance(frame * Vec3::Y) < 1e-5);
+    }
+
+    /// #60: the Outskirts blowing snow 839543 (start 3, beside the stone wall) blows its 8.3 m/s
+    /// streaks along its node's Z, not up. With direction 6 read as world up they shot straight
+    /// up at 8 to 60 m/s.
+    #[test]
+    fn blowing_snow_blows_sideways_not_up() {
+        let mut lib = FxrLib::scan(&sekiro_sim::cache::root());
+        let def = lib.compiled(839543).expect("blowing snow 839543 installed");
+        let mut n = make_node(&mut lib, &def, 1, 0).unwrap();
+        let dt = 1. / 30.;
+        let streaks = |n: &NodeInst| {
+            let s = &n.children[0].children[0];
+            s.particles
+                .iter()
+                .map(|p| (p.seed, s.world.transform_point(p.pos)))
+                .collect::<HashMap<_, _>>()
+        };
+        for _ in 0..15 {
+            step_node(&mut n, &mut lib, Transform::IDENTITY, dt, false);
+        }
+        let before = streaks(&n);
+        step_node(&mut n, &mut lib, Transform::IDENTITY, dt, false);
+        let after = streaks(&n);
+        let v: Vec<Vec3> = after
+            .iter()
+            .filter_map(|(k, p)| before.get(k).map(|q| (*p - *q) / dt))
+            .collect();
+        assert!(v.len() > 20, "{} streaks", v.len());
+        let mean = v.iter().sum::<Vec3>() / v.len() as f32;
+        assert!(
+            (7.0..10.0).contains(&mean.length()) && mean.xz().length() > 2.0 * mean.y.abs(),
+            "mean streak velocity {mean:?}"
+        );
     }
 }
