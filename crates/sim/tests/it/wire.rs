@@ -8,6 +8,12 @@ use sekiro_sim::{
 };
 use std::path::PathBuf;
 
+/// The map folder `dir`'s hooks, aimed through its collision ([`CollisionWorld::load_map`]).
+fn load_wire(dir: &std::path::Path) -> Wire {
+    let world = std::sync::Arc::new(CollisionWorld::load_map(dir).unwrap());
+    Wire::load(&cache(), dir, world).unwrap()
+}
+
 fn cache() -> PathBuf {
     sekiro_sim::cache::root()
 }
@@ -133,7 +139,7 @@ fn extracted_counts_transform_and_collision() {
         if !dir.join("grapple.json").exists() {
             continue;
         }
-        let wire = Wire::load(&cache(), &dir).unwrap();
+        let wire = load_wire(&dir);
         let names: std::collections::HashSet<_> = wire
             .points
             .iter()
@@ -230,11 +236,13 @@ fn real_hks_synthetic_ground_shot_and_out_of_range() {
 fn line_of_sight_blocks_wall() {
     use sekiro_formats::hknp::CollisionMesh;
     let mut wire = synthetic(10.0);
-    wire.collision = Some(CollisionWorld::from_mesh(&CollisionMesh {
-        vertices: vec![[-50.0, -50.0, -5.0], [50.0, -50.0, -5.0], [0.0, 50.0, -5.0]],
-        indices: vec![0, 1, 2],
-        ..CollisionMesh::default()
-    }));
+    wire.collision = Some(std::sync::Arc::new(CollisionWorld::from_mesh(
+        &CollisionMesh {
+            vertices: vec![[-50.0, -50.0, -5.0], [50.0, -50.0, -5.0], [0.0, 50.0, -5.0]],
+            indices: vec![0, 1, 2],
+            ..CollisionMesh::default()
+        },
+    )));
     wire.search(&Body::default(), 0.0, 0.0, false);
     assert!(wire.candidate.is_none());
 }
@@ -252,11 +260,13 @@ fn obstruction_during_travel_releases_wire() {
         1.0 / 60.0,
         &FlatGround::default()
     ));
-    wire.collision = Some(CollisionWorld::from_mesh(&CollisionMesh {
-        vertices: vec![[-50.0, -50.0, -5.0], [50.0, -50.0, -5.0], [0.0, 50.0, -5.0]],
-        indices: vec![0, 1, 2],
-        ..CollisionMesh::default()
-    }));
+    wire.collision = Some(std::sync::Arc::new(CollisionWorld::from_mesh(
+        &CollisionMesh {
+            vertices: vec![[-50.0, -50.0, -5.0], [50.0, -50.0, -5.0], [0.0, 50.0, -5.0]],
+            indices: vec![0, 1, 2],
+            ..CollisionMesh::default()
+        },
+    )));
     for _ in 0..60 {
         wire.step(
             &mut body,
@@ -320,7 +330,7 @@ fn castle_shachi_clear_approach_and_blocked_original_spawn() {
     if !dir.join("grapple.json").exists() {
         return;
     }
-    let mut wire = Wire::load(&cache(), &dir).unwrap();
+    let mut wire = load_wire(&dir);
     let body = Body {
         position: [103.5, 53.995594, 243.6],
         yaw: 139f32.to_radians(),
@@ -338,7 +348,7 @@ fn castle_shachi_clear_approach_and_blocked_original_spawn() {
         let mut duel = Duel::load(&cache(), 4.0).unwrap();
         duel.enemy_active = false;
         duel.player.ground = Box::new(CollisionWorld::load_map(&dir).unwrap());
-        duel.player.wire = Wire::load(&cache(), &dir).unwrap();
+        duel.player.wire = load_wire(&dir);
         duel.player.body = Body {
             position,
             yaw: yaw.to_radians(),
@@ -529,7 +539,7 @@ fn castle_roof_chain_route() {
         return;
     };
     duel.player.ground = Box::new(CollisionWorld::load_map(&dir).unwrap());
-    duel.player.wire = Wire::load(&cache(), &dir).unwrap();
+    duel.player.wire = load_wire(&dir);
     duel.player.body = Body {
         position: [104.03038, 53.234768, 254.9751],
         yaw: 60f32.to_radians(),
@@ -929,7 +939,7 @@ fn outskirts_pine_is_marked_only_when_the_camera_faces_it() {
     if !dir.join("grapple.json").exists() {
         return;
     }
-    let mut wire = Wire::load(&cache(), &dir).unwrap();
+    let mut wire = load_wire(&dir);
     let body = Body {
         position: [-140.0, -50.73, -132.0],
         ..Body::default()
@@ -1034,11 +1044,13 @@ fn search_camera_follows_the_rig_and_is_pulled_in_by_walls() {
     let camera = wire.search_camera(&body, 0.0, 0.0);
     assert!(camera.position.distance(Vec3::new(0.0, 1.2, 3.0)) < 1e-5);
     // A wall 2 m behind Wolf: the camera stops 0.3 m in front of it.
-    wire.collision = Some(CollisionWorld::from_mesh(&CollisionMesh {
-        vertices: vec![[-50.0, -50.0, 2.0], [50.0, -50.0, 2.0], [0.0, 50.0, 2.0]],
-        indices: vec![0, 1, 2],
-        ..CollisionMesh::default()
-    }));
+    wire.collision = Some(std::sync::Arc::new(CollisionWorld::from_mesh(
+        &CollisionMesh {
+            vertices: vec![[-50.0, -50.0, 2.0], [50.0, -50.0, 2.0], [0.0, 50.0, 2.0]],
+            indices: vec![0, 1, 2],
+            ..CollisionMesh::default()
+        },
+    )));
     let camera = wire.search_camera(&body, 0.0, 0.0);
     assert!(
         (camera.position.z - 1.7).abs() < 1e-4,
@@ -1068,7 +1080,7 @@ fn an_upward_flight_under_an_overhang_stops_before_the_head_enters_it() {
             1.0 / 60.0,
             &FlatGround::default(),
         );
-        wire.collision = collision;
+        wire.collision = collision.map(std::sync::Arc::new);
         let mut path = Vec::new();
         for _ in 0..50 {
             wire.step(
@@ -1169,7 +1181,7 @@ fn a_flight_away_from_a_beam_the_head_grazes_still_arrives() {
         1.0 / 60.0,
         &FlatGround::default(),
     );
-    wire.collision = Some(beam);
+    wire.collision = Some(std::sync::Arc::new(beam));
     for _ in 0..50 {
         wire.step(
             &mut body,
@@ -1342,4 +1354,57 @@ fn a_jump_keeps_the_perch_and_a_new_shot_clears_it() {
     eprintln!("second perch {:?}, feet {feet}", duel.player.wire.perch);
     assert!(cleared, "the first perch {first:?} outlived the shot");
     assert!(feet.distance(Vec3::new(0.0, 5.0, -20.0)) < 0.2, "{feet}");
+}
+
+/// Ashina Outskirts start 3 (#261): the first-visit story switches off entity group 1106610
+/// (`docs/MAP-COMPLETENESS.md`), so the play world neither draws nor collides with its objects,
+/// among them `o115720_0000`, whose hook hangs 7 m above Wolf about 15 m south. Its hook stayed
+/// live: facing it, it was marked and the wire flew Wolf into open sky, where the perch held him
+/// on an invisible platform. Hooks of switched-off objects are not offered; every other hook
+/// keeps its place.
+#[test]
+fn outskirts_hooks_on_story_switched_off_objects_are_not_offered() {
+    let dir = cache().join("maps/m11_00_00_00");
+    if !dir.join("grapple.json").exists() || !dir.join("object_collision.bin").exists() {
+        return;
+    }
+    let layout: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("layout.json")).unwrap()).unwrap();
+    let off = sekiro_sim::world_events::first_visit_off(&cache(), "m11_00_00_00", &layout).unwrap();
+    let raw: Vec<Point> =
+        serde_json::from_slice(&std::fs::read(dir.join("grapple.json")).unwrap()).unwrap();
+    let mut wire = load_wire(&dir);
+    assert_eq!(wire.points.len(), raw.len(), "hook indices keep their rows");
+    const HOOK: usize = 354;
+    assert_eq!(wire.points[HOOK].source_part, "o115720_0000");
+    assert!(off.contains("o115720_0000"));
+    let mut dropped = 0;
+    for (p, r) in wire.points.iter().zip(&raw) {
+        if r.position.is_some() && off.contains(&r.source_part) {
+            dropped += 1;
+            assert!(p.position.is_none(), "{} is switched off", r.source_part);
+        } else {
+            assert_eq!(p.position, r.position, "{} stays", r.source_part);
+        }
+    }
+    assert_eq!(dropped, 9, "group 1106610's nine hooks");
+    // Wolf at start 3, the camera turned to the hook.
+    let feet = Vec3::new(-197.5, -48.2, 150.7);
+    let hook = Vec3::from(raw[HOOK].position.unwrap());
+    let to = hook - feet;
+    let yaw = (-to.x).atan2(-to.z);
+    let body = Body {
+        position: feet.to_array(),
+        yaw,
+        ..Body::default()
+    };
+    wire.search(&body, yaw, -0.2, false);
+    let marked = wire
+        .preview
+        .as_ref()
+        .map(|t| &wire.points[t.index].source_part);
+    assert!(
+        marked.is_none_or(|part| !off.contains(part)),
+        "a switched-off object's hook is marked: {marked:?}"
+    );
 }

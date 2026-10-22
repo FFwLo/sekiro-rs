@@ -36,6 +36,28 @@ An activation part can be a meshless helper, so effects use its authored residen
 Native Outskirts event 11105107 deletes 1108010/1108020, waits two seconds and selects ordinary snow or invasion embers using flags 8302/9100, region 1102107 and map membership.
 Castle event 11115170 deletes and restores snow entity 1114350, suppressing it for invasion, regions 1112150/1112151 and player SpEffect 110040.
 The retained region graph resolves the authored composite indoor volumes.
+These event regions are the game's only data rule for indoor snow (#79): no param or GPARAM names an indoor state, and SpEffect 110040 in the Castle event is the underwater check (SpEffectParam "underwater judgment"), not an indoor one.
+Outskirts region 1102107 is one 20 x 16 x 8 m box over the temple building at MSB (94.4, -52.2, -154.1), collision h023200.
+The Sculptor's hall at start 0 (collision h022400) has LightSet 110 like that building but no region, so the event keeps its snow on there.
+Yet in the real game no snow falls inside the hall (checked by the user, 2026-10-22), so the engine hides weather under a roof by a rule not yet traced.
+
+### Roof cover for falling weather (#79)
+
+What the exe and data show (read-only Ghidra copy, `sekiro.exe` 1.6.0.0):
+- The camera snow 839500 is one GPUStandardParticle (action 10000) node.
+  Its fields2 slot 31, named `unkHideIndoors` by the community schema, is 1; slot 30 (`shadowDarkness`) is 0 and `particleCollision` is 0.
+  The same slot is 1 on 29 of the 47 installed 10000 actions, including skill effects such as 7111240, so it is not a weather-only switch, and its runtime reader was not found within the time box.
+- The GPU particle shaders have no indoor input.
+  `CS_VFX_StandardParticleCollision` only bounces particles off the camera depth buffer (`g_csDepthMap`, shape 6, restitution in `m_HitParam`); the pixel shaders multiply colour (not alpha) by the sun shadow volume by `g_ps_BillboardShadowIntensity`.
+- `GXVfxStandardParticleAppearance` (vtable 326abc8, init 40ea70 / 40f690, field parse 40eb10) is the CPU side; the character physics debug flag `DbgCheckRoof` (menu bc0280, read only in bcae00) belongs to a character roof sphere cast, not to effects.
+- No string in the exe names weather, rain, indoor or interior effects.
+
+What we do: after each map FX step, every particle of a falling-weather placement (camera-relative 10000) that lies below the highest play collision surface over its 0.5 m column is removed (`WeatherCover` in `crates/game/src/map_fx.rs`).
+That reproduces what the game shows (no snow under the hall roof, snow in the open yard and over the roof) without claiming the engine's mechanism.
+Columns are looked up lazily from `CollisionWorld::surfaces_at` and cached until the collision world changes.
+A flake falling under an eave is removed rather than hidden; for straight-falling snow the two look the same.
+Only the play mode has the collision; the map viewer and its render gates keep uncovered snow.
+The underwater SpEffect 110040 condition is not implemented.
 The rooftop ordinary-fight and Tomoe transitions are described in LIGHTING.md's Genichiro snow audit.
 
 ## Runtime and fidelity limits
@@ -345,7 +367,7 @@ The cause was the emission direction, in two places.
 
 Result at spot-056: the flame rises about 0.5 m above the coals with sparks above it, as in the reference (the coals themselves are still dark).
 At the 800140 pile the flames are about 1 m tall, which is what the data gives (height 1 to 2 times scale 0.56, plus 0.375 m/s for 1.5 s).
-Disc emitters (shape 401) still emit radially for direction 0; with the corrected rotation the 800140 smoke discs now rise through gravity and speed, the radial default is unverified.
+Disc emitters (shape 401) still emitted radially for direction 0 here; superseded by #264 below (a disk's own direction is its +Z).
 Open: spark sprites (width 0.05 times 0.56, texture 3000, rgb multiplier 15) are still fainter and fewer than in the reference, possibly a minimum screen size or bloom difference in the game.
 
 ## Emitter direction, 2026-10-22 (#60)
@@ -359,6 +381,19 @@ The InitialDirection enum (reference/fxr, as FwLo's RustSekiro `docs/kb/fxr.md` 
 The snow now blows along its region's yaw at about 8 m/s, and the 6-driven fog banks (839520, 839540, 839541, 839547) drift sideways at 0.3 to 1 m/s instead of rising.
 The torch 300163 and brazier 839530 nodes that motivated the world-up reading still rise through their negative gravity; their 6 nodes are slow (0.075 to 0.4 m/s).
 Open: object dummy orientation (FLVER dummy forward / upward) is not applied to map object effects, only the dummy position; the brazier dummy 200 faces +Z with +Y up, so it does not change these effects.
+
+## Disk emitter direction, 2026-10-22 (#264)
+
+Symptom: the night ground fire on Ashina Outskirts (`--spawn -222.37,-59.0,111.03,270,0 --hour 1`) spread its smoke flat along the ground; in the game it rises as a near-vertical column.
+The fire is the burning body pile o116060 (`o116060_2000`, ModelSfxParam 116060000, dummy 200) playing FXR 800140; the same effect is on two `SFX:焼死体の山` regions.
+Its smoke nodes are disk emitters (shape 401, radius 0.375, direction 0) turned +90 about X, with an 11.25 degree cone, 1.27 m/s and gravity -0.25 (rising), lasting 18 to 20 s.
+`emit_point` sent a disk's direction 0 out from the disk's centre, which the +90 turn lays flat, so the smoke spread sideways at 1.27 m/s.
+The reference/fxr enum (EvenTorset's fxr, `src/enums/InitialDirection.yml`) gives a point, disk or rectangle emitter's own direction as LocalNorth (+Z), a sphere's as out from its centre and a cylinder's as out from its axis.
+The disk now emits along its +Z, which the +90 turn stands upright.
+Headless, 10 s at the placement, free particles older than 1 s: before 1.9 m up for 4.3 m out from the fire; after 6.1 m up for 0.7 m out.
+The torch 300163, brazier 839530 and blowing snow 839542 do not use disk emitters and are unchanged.
+The brazier's smoke drifts 1.3 m up for 0.9 m sideways: its nodes are turned +45 about X under a node emitter (2202) with direction 3, global north, so every brazier leans the same world way; not yet compared with the game.
+Open: a box emitter's direction 0 (a random local axis inside, the face normal outside, per the same enum) is still read as +Z.
 
 ## Soft sprite pull and uniformScale, 2026-10-22 (#78)
 
