@@ -53,11 +53,13 @@ const WALK: &str = "\
 60 0 0 -
 ";
 
-/// Grapple from the Outskirts ledge east of the ravine to the branch over it, then, perched,
-/// turn the camera a full circle from step 400 (`--live-orbit`). The branch stands on no map
-/// collision (only the event walls h900000 and h900001 are below), so the map must stay on
-/// the ledge's collision part, whichever way the camera looks.
-const GRAPPLE_SPAWN: &str = "-132.3,-42.0,-123.9,90,0";
+/// Grapple from the Outskirts ledge by the pine's root, north of the ravine, to the far end of
+/// the branch over it, then, perched, turn the camera a full circle from step 400
+/// (`--live-orbit`). The branch stands on no map collision (only the event walls h900000 and
+/// h900001 are below), so the map must stay on the ledge's collision part, whichever way the
+/// camera looks. The spawn faces the far hook; the earlier one, east of the ravine at
+/// (-132.3, -42.0, -123.9), has had no floor since #189 (#231).
+const GRAPPLE_SPAWN: &str = "-136.5,-42.54,-118.0,41,0";
 const GRAPPLE: &str = "120 0 0 -
 1 0 0 grapple
 240 0 0 -
@@ -79,13 +81,14 @@ const TRUNK_SCRIPT: &str = "420 0 0 -
 const TRUNK_ROUTE: &str = "-136.2,-121.75;-136.4,-122.0;-136.6,-122.5;-136.9,-122.75;-137.1,-123.0;-137.4,-123.25;-137.75,-123.5;-138.0,-123.75;-138.6,-124.0;-139.4,-124.1;-140.4,-124.15;-139.4,-124.1;-138.6,-124.0;-138.0,-123.75;-137.75,-123.5;-137.4,-123.25;-137.1,-123.0;-136.9,-122.75;-136.6,-122.5;-136.4,-122.0;-136.2,-121.75;-136.1,-121.25;-136.05,-121.0;-136.15,-120.5;-136.25,-120.0;-136.35,-119.5;-136.15,-119.0;-136.0,-118.5;-135.9,-117.5";
 const TREE: &str = "m11_00_00_00/o002500_0005";
 
-fn run(root: &Path, out: &Path, name: &str, extra: &[&str]) -> Value {
+/// Runs Explore with `--live-check`, from `root` with the extracted `cache`.
+fn run(root: &Path, cache: &Path, out: &Path, name: &str, extra: &[&str]) -> Value {
     let summary = out.join(format!("{name}.json"));
     let status = Command::new(env!("CARGO_BIN_EXE_sekiro-rs"))
         .current_dir(root)
         .args(EXPLORE)
         .arg("--cache")
-        .arg(root.join("cache"))
+        .arg(cache)
         .arg("--live-check")
         .arg(&summary)
         .args(extra)
@@ -95,6 +98,43 @@ fn run(root: &Path, out: &Path, name: &str, extra: &[&str]) -> Value {
     serde_json::from_slice(&std::fs::read(&summary).expect("live check summary")).unwrap()
 }
 
+/// `--play` with no `--map` is the flat-floor fight (`docs/GETTING-STARTED.md`). It panicked
+/// at startup on a map-only resource (issue #139); the fight must load and play for 10 s.
+#[test]
+#[ignore = "slow: opens a game window for about 25 s; needs a GPU and the extracted cache"]
+fn flat_floor_fight_starts_without_a_map() {
+    let cache = sekiro_sim::cache::root();
+    if !cache.join("models").is_dir() {
+        eprintln!("skipped: no extracted cache");
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("sekiro-live-floor-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let summary = out.join("floor.json");
+    let status = Command::new(env!("CARGO_BIN_EXE_sekiro-rs"))
+        .args(["--play", "--passive", "--break-posture", "--lock-on"])
+        .arg("--cache")
+        .arg(&cache)
+        .arg("--live-check")
+        .arg(&summary)
+        .args(["--live-seconds", "10"])
+        .status()
+        .expect("start the game");
+    assert!(status.success(), "the game exited with {status}");
+    let s: Value = serde_json::from_slice(&std::fs::read(&summary).unwrap()).unwrap();
+    let samples = s["samples"].as_array().expect("samples");
+    assert!(
+        samples.len() >= 30 && samples.iter().all(|v| v["grounded"] == true),
+        "Wolf did not stand on the floor for 10 s of play: {s:#}"
+    );
+    println!(
+        "floor: ready {:.1} s, {} samples, frames median {:.1} ms",
+        number(&s, "play_ready_s"),
+        samples.len(),
+        number(&s, "frame_ms_median")
+    );
+}
+
 fn number(summary: &Value, key: &str) -> f64 {
     summary[key]
         .as_f64()
@@ -102,10 +142,12 @@ fn number(summary: &Value, key: &str) -> f64 {
 }
 
 #[test]
-#[ignore = "slow: opens a game window and loads Ashina Outskirts five times, about 6 minutes; needs a GPU and the extracted cache"]
+#[ignore = "slow: opens a game window and loads Ashina Outskirts five times, about 9 minutes; needs a GPU and the extracted cache"]
 fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if !root.join("cache/maps/m11_00_00_00/layout.json").is_file() {
+    // `SEKIRO_CACHE` or the checkout's own: a second clone has no `cache/` of its own.
+    let cache = sekiro_sim::cache::root();
+    if !cache.join("maps/m11_00_00_00/layout.json").is_file() {
         eprintln!("skipped: Ashina Outskirts is not extracted");
         return;
     }
@@ -119,7 +161,13 @@ fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
     std::fs::write(&trunk, TRUNK_SCRIPT).unwrap();
 
     // A scripted walk from the menu's start, timed from launch.
-    let s = run(&root, &out, "walk", &["--script", walk.to_str().unwrap()]);
+    let s = run(
+        &root,
+        &cache,
+        &out,
+        "walk",
+        &["--script", walk.to_str().unwrap()],
+    );
     println!(
         "walk: ready {:.1} s, longest loading frame {:.0} ms, frames median {:.1} ms p95 {:.1} ms, holes {}/{}",
         number(&s, "play_ready_s"),
@@ -157,7 +205,7 @@ fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
     assert!(moved > 3.0, "the walk did not move Wolf ({moved:.1} m)");
 
     // Every authored player start: drawn ground under Wolf after a teleport.
-    let s = run(&root, &out, "starts", &["--live-tour", "starts"]);
+    let s = run(&root, &cache, &out, "starts", &["--live-tour", "starts"]);
     let stops = s["stops"].as_array().expect("tour stops");
     assert!(stops.len() >= 9, "player starts missing from the tour");
     for stop in stops {
@@ -171,7 +219,7 @@ fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
 
     // Far into Ashina Castle (block m11_01), 300 to 600 m from the start: the connected blocks
     // draw where Wolf stands after loading from the Outskirts.
-    let s = run(&root, &out, "castle", &["--live-tour", CASTLE]);
+    let s = run(&root, &cache, &out, "castle", &["--live-tour", CASTLE]);
     let stops = s["stops"].as_array().expect("tour stops");
     assert_eq!(stops.len(), 7, "tour stops missing");
     for stop in stops {
@@ -219,6 +267,7 @@ fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
     // groups and the map around Wolf stays drawn at every camera yaw.
     let s = run(
         &root,
+        &cache,
         &out,
         "grapple",
         &[
@@ -282,6 +331,7 @@ fn outskirts_loads_then_plays_smoothly_on_drawn_ground() {
     // way to the tip and back up to the platform, never falling into the ravine.
     let s = run(
         &root,
+        &cache,
         &out,
         "trunk",
         &[

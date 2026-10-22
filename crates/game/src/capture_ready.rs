@@ -136,26 +136,33 @@ impl LateMeshes {
 /// Main world: report new mesh entities and mark entities changed once their late mesh is
 /// prepared. Entities are kept only until the render world has checked their mesh; a mesh
 /// handle swapped on an existing entity counts as new too.
+///
+/// Mesh residency ([`crate::mesh_residency`]) is installed only with a map. Without it (the
+/// flat-floor fight of `--play` with no `--map`) nothing retires meshes from the GPU, so every
+/// mesh asset still in the main world counts as referenced.
 #[allow(clippy::type_complexity)]
 fn watch_meshes(
     late: Res<LateMeshes>,
     assets: Res<Assets<Mesh>>,
-    refs: Res<crate::mesh_residency::MeshRefs>,
+    refs: Option<Res<crate::mesh_residency::MeshRefs>>,
     mut meshes: ParamSet<(
         Query<(Entity, &Mesh3d, Has<RuntimeMesh>), Changed<Mesh3d>>,
         Query<&mut Mesh3d>,
     )>,
     mut unchecked: Local<std::collections::HashMap<AssetId<Mesh>, Vec<Entity>>>,
-    mut removed: RemovedComponents<Mesh3d>,
+    mut refs_seen: Local<Option<Option<u64>>>,
     mut asset_events: MessageReader<bevy::asset::AssetEvent<Mesh>>,
 ) {
-    let retired = removed.read().next().is_some();
-    removed.clear();
-    let retired_assets = asset_events.read().next().is_some();
-    asset_events.clear();
-    if unchecked.is_empty() && meshes.p0().is_empty() && !retired && !retired_assets {
+    // Only a removed asset or a mesh no entity uses any more can retire a mesh. Cloth, effect
+    // batches and the sky rewrite meshes every frame (`Modified`), which retires nothing, and
+    // pruning on those rescanned every loaded mesh each frame (#70).
+    let revision = refs.as_ref().map(|r| r.revision());
+    let retired = mesh_retired(asset_events.read(), &mut refs_seen, revision);
+    if unchecked.is_empty() && meshes.p0().is_empty() && !retired {
         return;
     }
+    let referenced =
+        |id: AssetId<Mesh>| assets.contains(id) && refs.as_ref().is_none_or(|r| r.contains(id));
     let (on_time, ready) = {
         let mut state = late.0.lock().unwrap();
         for (entity, mesh, runtime) in &meshes.p0() {
@@ -169,8 +176,8 @@ fn watch_meshes(
         }
         // A static merge can retire the last entity using a source before its upload.
         // CPU fallback assets still exist, but are no longer part of the loading gate.
-        if retired || retired_assets {
-            state.forget_removed(|id| assets.contains(id) && refs.contains(id));
+        if retired {
+            state.forget_removed(referenced);
         }
         (
             std::mem::take(&mut state.on_time),
@@ -188,9 +195,27 @@ fn watch_meshes(
         }
     }
     // A mesh asset removed before the render world prepared it never reports back.
-    if retired || retired_assets {
-        unchecked.retain(|id, _| assets.contains(*id) && refs.contains(*id));
+    if retired {
+        unchecked.retain(|id, _| referenced(*id));
     }
+}
+
+/// Whether a mesh may have been retired since the last call: a mesh asset was removed, or the
+/// set of meshes some entity uses changed (`revision`, [`crate::mesh_residency::MeshRefs`];
+/// `None` without a map, where only removal retires a mesh). Reads every event, so none carry
+/// over to the next frame.
+fn mesh_retired<'a>(
+    events: impl Iterator<Item = &'a bevy::asset::AssetEvent<Mesh>>,
+    seen: &mut Option<Option<u64>>,
+    revision: Option<u64>,
+) -> bool {
+    // Counted rather than `any`, so the reader is drained every frame.
+    let removed = events
+        .filter(|event| matches!(event, bevy::asset::AssetEvent::Removed { .. }))
+        .count()
+        > 0;
+    let refs_changed = seen.replace(revision) != Some(revision);
+    removed || refs_changed
 }
 
 /// Render world, after specialization: sort newly reported meshes into prepared and waiting,
@@ -438,6 +463,76 @@ mod tests {
         state.check(|id| on_gpu.contains(&id));
         assert_eq!(state.loading.len(), 0);
         assert!(state.waiting.contains(&map));
+    }
+
+    /// `--play` without `--map` installs the ready gate but not the map's mesh residency
+    /// (issue #139): the gate must run on its own, including when meshes are retired.
+    #[test]
+    fn gate_runs_without_map_mesh_residency() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>();
+        install(&mut app);
+        assert!(
+            !app.world()
+                .contains_resource::<crate::mesh_residency::MeshRefs>()
+        );
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::default());
+        let entity = app.world_mut().spawn(Mesh3d(mesh.clone())).id();
+        app.update();
+        assert_eq!(app.world().resource::<LateMeshes>().loading(), 1);
+        app.world_mut().despawn(entity);
+        app.update();
+        assert_eq!(
+            app.world().resource::<LateMeshes>().loading(),
+            1,
+            "a mesh still in the main world keeps holding the gate until prepared"
+        );
+    }
+
+    /// #70: cloth, effect batches and the sky rewrite meshes every frame. Those `Modified`
+    /// events must not rescan every loaded mesh; only a removed asset or a mesh losing its last
+    /// entity can retire one.
+    #[test]
+    fn rewritten_meshes_retire_nothing() {
+        use bevy::asset::AssetEvent;
+        let id = AssetId::<Mesh>::Uuid {
+            uuid: bevy::asset::uuid::Uuid::from_u128(1),
+        };
+        let mut seen = None;
+        assert!(
+            mesh_retired([].iter(), &mut seen, Some(0)),
+            "first frame prunes"
+        );
+        let rewrites = [AssetEvent::Modified { id }, AssetEvent::Modified { id }];
+        for _ in 0..3 {
+            assert!(!mesh_retired(rewrites.iter(), &mut seen, Some(0)));
+        }
+        assert!(mesh_retired(
+            [AssetEvent::Modified { id }, AssetEvent::Removed { id }].iter(),
+            &mut seen,
+            Some(0)
+        ));
+        assert!(
+            mesh_retired(rewrites.iter(), &mut seen, Some(1)),
+            "refs changed"
+        );
+        assert!(!mesh_retired([].iter(), &mut seen, Some(1)));
+        // Without a map there is no `MeshRefs`: only a removed asset retires a mesh.
+        let mut seen = None;
+        assert!(
+            mesh_retired([].iter(), &mut seen, None),
+            "first frame prunes"
+        );
+        assert!(!mesh_retired(rewrites.iter(), &mut seen, None));
+        assert!(mesh_retired(
+            [AssetEvent::Removed { id }].iter(),
+            &mut seen,
+            None
+        ));
     }
 
     #[test]

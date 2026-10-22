@@ -137,6 +137,7 @@ fn stepping_forward_away_from_an_unlocked_thrust_does_not_counter() {
         let r = d.step(
             &InputFrame {
                 camera_yaw: std::f32::consts::PI,
+                camera_pitch: 0.0,
                 move_stick: if i == 35 { [0.0, 1.0] } else { [0.0; 2] },
                 buttons: Buttons {
                     dodge: i == 35,
@@ -193,7 +194,7 @@ fn forward_step_window_and_counter_dummies_follow_the_data() {
 }
 
 fn cache() -> Option<PathBuf> {
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     let ok = cache.join("anim/c1010/tae.json").is_file()
         && cache.join("anim/c5060/tae.json").is_file()
         && cache.join("raw/action/script/c0000.hks").is_file();

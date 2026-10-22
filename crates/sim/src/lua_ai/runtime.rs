@@ -39,6 +39,12 @@ const PLAN_DODGE_BACK: i32 = -10003;
 const OBJ_AI: u8 = 0;
 const OBJ_GOAL: u8 = 1;
 
+/// `POINT_INITIAL` (`ai_define.lua`): where the character was placed.
+const POINT_INITIAL: i32 = 100;
+
+/// `GOAL_COMMON_Stay` (`goal_list.lua`).
+const GOAL_STAY: i32 = 2;
+
 /// The engine's leaf goals, by goal id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeGoal {
@@ -49,6 +55,8 @@ pub enum NativeGoal {
     Wait,
     /// 2019 MoveToSomewhere and its variants: move until within a distance of a target.
     MoveTo,
+    /// 4 BackToHome(life, ...): walk back to the initial position.
+    BackToHome,
     /// 2101 Guard: hold the guard action for the lifetime.
     Guard,
     /// 2017 SidewayMove and variants: strafe around the target.
@@ -60,6 +68,12 @@ pub enum NativeGoal {
     /// 2200 CommonAttack, 2020 SpinStep, 2113 Parry, 2107 ApproachStep: request an action and
     /// wait for its animation.
     Action,
+    /// 5100 ConfirmCautionTarget(life, anim, target, time, waitTarget): the look round at a
+    /// caution spot (CSGoalConfirmCautionTarget, FUN_1405c35a0 / FUN_1405c3770, traced by
+    /// FwLo's RustSekiro): CommonAttack(anim) at the target when the anim is set, Wait(time),
+    /// and on Terminate give the spot up (the sound target is cleared) while still in caution
+    /// with no new sound, so the logic goes back to NonBattleAct.
+    ConfirmCaution,
     /// Anything else the engine implements: succeeds at once (logged).
     Unsupported,
 }
@@ -71,13 +85,15 @@ impl NativeGoal {
             PLAN_DEFLECT => NativeGoal::PlanDeflect,
             PLAN_DODGE_BACK => NativeGoal::PlanDodgeBack,
             2000 | 2 | 5000 => NativeGoal::Wait,
-            2019 | 2013 | 2025 | 2026 | 2027 | 2023 | 2024 | 2028 | 4 => NativeGoal::MoveTo,
+            2019 | 2013 | 2025 | 2026 | 2027 | 2023 | 2024 | 2028 => NativeGoal::MoveTo,
+            4 => NativeGoal::BackToHome,
             2101 => NativeGoal::Guard,
             2017 | 2030 | 2036 => NativeGoal::Sideway,
             2018 => NativeGoal::KeepDist,
             2016 => NativeGoal::Leave,
             2200 | 2020 | 2113 | 2107 => NativeGoal::Action,
-            2031..=2037 | 2500..=2504 | 5100 => NativeGoal::Unsupported,
+            5100 => NativeGoal::ConfirmCaution,
+            2031..=2037 | 2500..=2504 => NativeGoal::Unsupported,
             _ => return None,
         })
     }
@@ -150,8 +166,17 @@ impl Goal {
     fn param(&self, i: usize) -> f64 {
         self.params.get(i).and_then(Value::num).unwrap_or(0.0)
     }
+    /// A flag parameter as the exe reads it: goal parameters are stored as floats
+    /// (AddGoal FUN_1405ce510) and the native goals test a walk flag as `0.0 < param`
+    /// (ApproachTarget's param 3 in FUN_1405c7e80, KeepDist's param 4 in FUN_1405c7c40, both
+    /// passed to the move request FUN_1405e6640). A Lua `false` and the brain's `0.0` both
+    /// read as unset.
     fn param_bool(&self, i: usize) -> bool {
-        self.params.get(i).is_some_and(Value::truthy)
+        match self.params.get(i) {
+            Some(Value::Num(x)) => *x > 0.0,
+            Some(Value::Bool(b)) => *b,
+            _ => false,
+        }
     }
 }
 
@@ -281,6 +306,22 @@ pub struct ActHook {
     pub started: Vec<(f32, usize)>,
 }
 
+/// The AI-state SpEffects (SpEffectParam names): 200000 normal, 200001 non-combat caution,
+/// 200002 combat caution, 200004 find/battle. One replaces another (spCategory 100, priority 1).
+pub const AI_STATE_EFFECTS: [i32; 4] = [200000, 200001, 200002, 200004];
+
+/// A heard AI sound held as the target slot (FwLo's `stealth::Sound`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoundTarget {
+    /// Where it was made.
+    pub pos: [f32; 3],
+    /// Its AiSoundParam row and rank (AI_SOUND_RANK__NORMAL 0, IMPORTANT 1).
+    pub id: i32,
+    pub rank: i32,
+    /// Seconds until forgotten.
+    pub forget: f32,
+}
+
 /// Registered goal and logic information plus all per-character AI state. Implements the
 /// scripts' [`Host`].
 pub struct AiState {
@@ -290,6 +331,11 @@ pub struct AiState {
     pub table_goals: HashSet<i32>,
     pub combo_cancel: HashSet<i32>,
     pub goals: Vec<Option<Goal>>,
+    /// Each goal slot's last update result, kept when the slot is freed and reused: the
+    /// exe's 32 pooled goals (FUN_1405ad1d0) keep +0x1f8 across AddGoal (FUN_1405ce510 never
+    /// resets it), so `goal:GetLastResult` (FUN_1405fa890) in a fresh goal's Activate reads
+    /// the result its slot last stored; -1 before the slot's first update (FUN_1405cd180).
+    pub slot_results: Vec<i32>,
     pub top: u32,
     pub replan: bool,
     pub world: AiWorld,
@@ -324,6 +370,16 @@ pub struct AiState {
     /// the previous logic run; the engine keeps both (state object +0x158 and +0x15C).
     pub target_state: i32,
     pub prev_target_state: i32,
+    /// The sound target slot (the exe's targeting system, FwLo's RustSekiro `src/stealth.rs`):
+    /// the last AI sound heard, a CAUTION target while no enemy is seen.
+    pub sound: Option<SoundTarget>,
+    /// A sound target was taken or changed since the last tick: INTERUPT_ChangeSoundTarget.
+    pub sound_new: bool,
+    /// The AI-state SpEffect the last alert anim put on me ([`AI_STATE_EFFECTS`]): the anims
+    /// add it in their TAE (c1010's 1010 adds 200001, 1040 200004, 401020 200002, 101000 and
+    /// 401000 200000) and it lasts (effectEndurance -1) until another replaces it (FwLo's
+    /// `ai_sp`). None until an anim sets one.
+    pub ai_mark: Option<i32>,
     /// The interrupt being dispatched (INTERUPT_* id), answered by `IsInterupt`.
     pub interrupt: Option<i32>,
     /// Edge detection for the world's interrupt sources.
@@ -349,6 +405,7 @@ impl AiState {
             table_goals: HashSet::new(),
             combo_cancel: HashSet::new(),
             goals: Vec::new(),
+            slot_results: Vec::new(),
             top: 0,
             replan: false,
             world: AiWorld::default(),
@@ -375,6 +432,9 @@ impl AiState {
             battle: false,
             target_state: 0,
             prev_target_state: 0,
+            sound: None,
+            sound_new: false,
+            ai_mark: None,
             interrupt: None,
             last_parry_timing: false,
             observed_effects: Vec::new(),
@@ -384,6 +444,40 @@ impl AiState {
         };
         s.top = s.new_goal(0, -1.0, Vec::new(), None);
         s
+    }
+
+    /// An AI sound reached me from `pos`: it becomes my sound target for
+    /// SoundTargetForgetTime. A held sound of a higher rank is kept (the exe listener takes a
+    /// rank 0 sound only over none or another rank 0 one; FwLo's `Targeting::hear`). A new id
+    /// raises INTERUPT_ChangeSoundTarget (gap: the exe compares the record serial; a refreshed
+    /// footstep is one sound here, as in FwLo's port).
+    pub fn hear(&mut self, pos: [f32; 3], id: i32, rank: i32) {
+        if self.sound.is_some_and(|s| s.rank > rank) {
+            return;
+        }
+        self.sound_new |= self.sound.is_none_or(|s| s.id != id);
+        let forget = self
+            .think
+            .fields
+            .get("SoundTargetForgetTime")
+            .copied()
+            .unwrap_or(0.0) as f32;
+        self.sound = Some(SoundTarget {
+            pos,
+            id,
+            rank,
+            forget,
+        });
+    }
+
+    /// Counts the sound target's forget time down.
+    pub fn age_sound(&mut self, dt: f32) {
+        if let Some(s) = &mut self.sound {
+            s.forget -= dt;
+            if s.forget <= 0.0 {
+                self.sound = None;
+            }
+        }
     }
 
     pub fn name(&self, kind: i32) -> String {
@@ -433,6 +527,9 @@ impl AiState {
             face_first: false,
             plan_step: None,
         };
+        // The lowest free slot, as the exe's pool hands out goals: FUN_1405ade50 scans its 32
+        // slots from 0 for the first whose +0xa0 is -1 (FUN_1405cff90; freeing, FUN_1405cedd0,
+        // sets it back to -1). `slot_results` relies on this order.
         if let Some(i) = self.goals.iter().position(Option::is_none) {
             self.goals[i] = Some(g);
             i as u32
@@ -470,13 +567,53 @@ impl AiState {
     fn position(&self, target: i32) -> Option<[f32; 3]> {
         match target {
             -1 => Some(self.world.me.position),
-            0 | 21 => self.world.target.as_ref().map(|t| t.position),
+            // Unseen, the current target is the caution spot (FwLo's `Snapshot`).
+            0 | 21 => self
+                .world
+                .target
+                .as_ref()
+                .map(|t| t.position)
+                .or(self.sound.map(|s| s.pos)),
             20 => self.event_target.as_ref().map(|t| t.position),
             100 | 111 | 121 | 125 => Some(self.world.home),
             102 => self.event_move_target,
             103 => self.patrol.as_ref().and_then(|p| p.position()),
             _ => None,
         }
+    }
+
+    /// How far I am from my move point, which NonBattleAct compares with its walk-home
+    /// distance (#217). The exe (FUN_1405afea0 over FUN_1405b04d0, stored at AI +0x9084 and
+    /// read by GetMovePointEffectRange) measures in 3D from my position to the segment between
+    /// the current route point and the previous one (or my initial position, POINT 100, before
+    /// the first step), to the last point once a route has ended, and to my initial position
+    /// with no route. Its first case, an active event move area (AI +0x9160), is not modelled.
+    fn move_point_effect_range(&self) -> f32 {
+        let me = glam::Vec3::from_array(self.world.me.position);
+        let home = self.world.home;
+        let (a, b) = match &self.patrol {
+            Some(p) if p.current >= 0 => {
+                let b = (p.previous >= 0 && p.previous != p.current)
+                    .then(|| p.point(p.previous))
+                    .flatten();
+                (p.point(p.current), Some(b.unwrap_or(home)))
+            }
+            Some(p) if p.previous >= 0 => (p.point(p.previous), None),
+            _ => (Some(home), None),
+        };
+        let a = glam::Vec3::from_array(a.unwrap_or(home));
+        let Some(b) = b.map(glam::Vec3::from_array) else {
+            return me.distance(a);
+        };
+        // FUN_1419ef320: the nearest point of the segment a..b, clamped to its ends.
+        let ab = b - a;
+        let along = ab.dot(me - a);
+        let t = if along <= 0.0 {
+            0.0
+        } else {
+            (along / ab.length_squared()).min(1.0)
+        };
+        me.distance(a + ab * t)
     }
 
     fn dist(&self, target: i32) -> f32 {
@@ -537,6 +674,9 @@ impl AiState {
         // The engine marks the AI state with SpEffects: 200001 non-combat caution, 200002
         // combat caution, 200004 find/battle (SpEffectParam names).
         if target == -1 && id == 200004 && self.target_state >= 2 {
+            return true;
+        }
+        if target == -1 && AI_STATE_EFFECTS.contains(&id) && self.ai_mark == Some(id) {
             return true;
         }
         self.actor(target)
@@ -888,11 +1028,18 @@ impl AiState {
                 }
                 vec![]
             }
-            // Unset parameters read as 0, like the engine's zero-filled parameter array.
+            // Unset parameters read as 0, like the engine's zero-filled parameter array. The exe
+            // stores goal parameters as floats (AddGoal FUN_1405ce510, GetParam FUN_1405cfb00),
+            // so a Lua boolean comes back as a number: NonBattleAct's walk test
+            // `GetParam(2) == 0` holds for the `false` _COMMON_AddNonBattleGoal passes.
             "GetParam" => vec![match self.goal(id).params.get(n(0) as usize) {
                 None | Some(Value::Nil) => Value::Num(0.0),
+                Some(Value::Bool(b)) => Value::Num(if *b { 1.0 } else { 0.0 }),
                 Some(v) => v.clone(),
             }],
+            "GetLastResult" => num(f64::from(
+                self.slot_results.get(id as usize).copied().unwrap_or(-1),
+            )),
             "GetLife" => num(self.goal(id).life as f64),
             "GetSubGoalNum" => num(self.goal(id).subgoals.len() as f64),
             "GetNumber" => num(*self.goal(id).numbers.get(&(n(0) as i32)).unwrap_or(&0.0)),
@@ -1069,16 +1216,36 @@ impl AiState {
                 .as_ref()
                 .and_then(|p| p.arrival(t(0)))
                 .map_or(0, |a| a.1) as f64),
+            "GetMovePointEffectRange" => num(self.move_point_effect_range() as f64),
             "IsRouteEnd" => boolean(self.patrol.as_ref().is_none_or(|p| p.ended())),
+            // The MSB enemy's small act (its init_anim_id_type, part data +0x22) names a row
+            // whose anim id GetSmallActAnimId returns; with no row (-1, as for nearly every
+            // map enemy) it returns -1 (FUN_140604450 over FUN_14060c1b0) and the waits 0
+            // (FUN_1406044d0), so NonBattleAct stays at home instead of queueing a
+            // WaitWithAnime of anim 0. The rows' table is not identified: -1 for all
+            // (docs/FIDELITY.md), as FwLo's `src/ai.rs` returns.
+            "GetSmallActAnimId" => num(-1.0),
+            "GetSmallActPreWaitTime" | "GetSmallActPostWaitTime" => num(0.0),
             "StepNextMovePoint" => {
                 if let Some(p) = &mut self.patrol {
                     p.step(self.rng);
                 }
                 vec![]
             }
-            "IsSearchTarget" | "IsVisibleTarget" | "IsVisibleCurrTarget" => {
-                boolean(self.world.target.is_some())
-            }
+            "IsVisibleTarget" | "IsVisibleCurrTarget" => boolean(self.world.target.is_some()),
+            "IsSearchTarget" => boolean(self.world.target.is_some() || self.sound.is_some()),
+            // AI_TARGET_TYPE__NORMAL_ENEMY 3, __SOUND 4 (ai_define.lua).
+            "GetCurrTargetType" => num(if self.world.target.is_some() {
+                3.0
+            } else if self.sound.is_some() {
+                4.0
+            } else {
+                0.0
+            }),
+            "GetLatestSoundTargetID" => num(self.sound.map_or(0, |s| s.id) as f64),
+            "GetLatestSoundTargetRank" => num(self.sound.map_or(0, |s| s.rank) as f64),
+            // The sound record's serial, -1 without one (FwLo: FUN_1405e3680); ours is the id.
+            "GetLatestSoundTargetInstanceID" => num(self.sound.map_or(-1, |s| s.id) as f64),
             "IsInterupt" => boolean(self.interrupt == Some(t(0))),
             "IsLadderAct"
             | "IsForceBattleGoal"
@@ -1111,12 +1278,7 @@ impl AiState {
                     .and_then(|regions| regions.point(t(0)));
                 vec![]
             }
-            "GetTeamOrder"
-            | "GetChangeBattleStateCount"
-            | "GetCurrTargetType"
-            | "GetMovePointEffectRange"
-            | "GetLatestSoundTargetID"
-            | "GetOddsParamIdOffset" => num(0.0),
+            "GetTeamOrder" | "GetChangeBattleStateCount" | "GetOddsParamIdOffset" => num(0.0),
             "TurnTo" => {
                 self.request.face_yaw = self.yaw_to(t(0));
                 vec![]
@@ -1175,11 +1337,14 @@ impl AiState {
             | "RemoveTriggerRegionObserver"
             | "SetTableLogic"
             | "SetNormalLogic"
-            | "ClearSoundTarget"
             | "ClearIndicationPosTarget"
             | "ClearLastMemoryTargetPos"
             | "SetEnableEndureCancel_forGoal"
             | "ClearEnableEndureCancel_forGoal" => vec![],
+            "ClearSoundTarget" => {
+                self.sound = None;
+                vec![]
+            }
             "DbgGetForceActIdx" | "DbgGetForceKengekiActIdx" => num(0.0),
             // Free floor in every direction: the whole probed distance is walkable. The engine
             // probes its navmesh here; our arenas are open (see docs/AI.md).
@@ -1194,6 +1359,16 @@ impl AiState {
 /// Runs one tick of the goal tree.
 pub fn tick(vm: &mut Vm, st: &mut AiState, world: AiWorld) {
     st.world = world;
+    if let Some(&id) = st
+        .world
+        .me
+        .sp_effects
+        .iter()
+        .rev()
+        .find(|id| AI_STATE_EFFECTS.contains(id))
+    {
+        st.ai_mark = Some(id);
+    }
     let dt = st.world.dt;
     st.time += dt;
     st.request = Request::default();
@@ -1221,6 +1396,11 @@ pub fn tick(vm: &mut Vm, st: &mut AiState, world: AiWorld) {
     st.last_parry_timing = st.world.parry_timing;
     if st.world.damaged {
         fired.push(2);
+    }
+    if st.sound_new
+        && let Some(kind) = vm.get_global("INTERUPT_ChangeSoundTarget").num()
+    {
+        fired.push(kind as i32);
     }
     for kind in fired {
         dispatch_interrupt(vm, st, kind);
@@ -1279,6 +1459,7 @@ pub fn tick(vm: &mut Vm, st: &mut AiState, world: AiWorld) {
     if st.request.face_yaw.is_none() && st.battle {
         st.request.face_yaw = st.yaw_to(0);
     }
+    st.sound_new = false;
 }
 
 /// Offers interrupt `kind` to the logic, then to the active goals from the deepest up, until
@@ -1420,11 +1601,30 @@ fn terminate(vm: &mut Vm, st: &mut AiState, id: u32) {
     if st.goal(id).activated {
         call_cb(vm, st, id, "Terminate");
     }
+    // ConfirmCautionTarget's Terminate (FUN_1405c3770, FwLo's trace): still in CAUTION and no
+    // new sound this tick (INTERUPT_ChangeSoundTarget), so the caution target is given up.
+    if st.goal(id).imp == GoalImpl::Native(NativeGoal::ConfirmCaution)
+        && st.target_state == 1
+        && !st.sound_new
+    {
+        st.sound = None;
+    }
     st.goals[id as usize] = None;
 }
 
-/// Updates goal `id` (activating it first) and returns its result.
+/// Updates goal `id` (activating it first) and returns its result, which its slot keeps
+/// (`AiState::slot_results`; the exe writes goal +0x1f8 on every update, FUN_1405d06c0).
 fn update(vm: &mut Vm, st: &mut AiState, id: u32, depth: usize) -> i32 {
+    let result = update_goal(vm, st, id, depth);
+    let slot = id as usize;
+    if st.slot_results.len() <= slot {
+        st.slot_results.resize(slot + 1, -1);
+    }
+    st.slot_results[slot] = result;
+    result
+}
+
+fn update_goal(vm: &mut Vm, st: &mut AiState, id: u32, depth: usize) -> i32 {
     if depth > 24 {
         return RESULT_FAILED;
     }
@@ -1637,7 +1837,10 @@ fn native_update(st: &mut AiState, id: u32, n: NativeGoal) -> i32 {
             action_update(st, id, &g)
         }
         NativeGoal::Wait => {
-            let target = g.param(0) as i32;
+            // Wait(life, turnTarget, ...) but Stay(life, ?, turnTarget): NonBattleAct's
+            // `Stay(life, 0, POINT_INIT_POSE)` turns to its post, not to TARGET_ENE_0 (FwLo's
+            // `src/ai.rs`, Native::Stay).
+            let target = g.param(if g.kind == GOAL_STAY { 1 } else { 0 }) as i32;
             if target != -1 && target != -2 {
                 st.request.face_yaw = st.yaw_to(target);
             }
@@ -1648,14 +1851,22 @@ fn native_update(st: &mut AiState, id: u32, n: NativeGoal) -> i32 {
             let target = g.param(0) as i32;
             let dist = g.param(2) as f32;
             let walk = g.param_bool(4);
-            if st.dist(target)
-                <= dist.max(0.0)
-                    + if target == 103 {
-                        st.world.hit_radius
-                    } else {
-                        0.0
-                    }
-            {
+            // The exe's IsArrived (FUN_1405b9070, read by the move update FUN_1405caa00, as
+            // FwLo's `src/ai.rs` traced it) arrives closer than my own radius plus the goal's
+            // distance, strictly, for every target; its GetDist subtracts the same radius, so
+            // the scripts' distances agree with it. Our GetDist is centre to centre (bar
+            // `dist_offset`), so the radius is added here only for the patrol point, whose
+            // distance no script reads; for other targets the arrival stays in GetDist's terms
+            // (docs/FIDELITY.md, #114). A negative distance counts as 0 (not traced), so the
+            // goal can still end. Reaching the patrol point steps the route, as the exe's move
+            // goals do in their terminate callbacks; no AI script calls StepNextMovePoint, so
+            // this is the route's only step.
+            let radius = if target == 103 {
+                st.world.hit_radius
+            } else {
+                0.0
+            };
+            if st.dist(target) < dist.max(0.0) + radius {
                 if target == 103
                     && let Some(p) = &mut st.patrol
                 {
@@ -1666,6 +1877,23 @@ fn native_update(st: &mut AiState, id: u32, n: NativeGoal) -> i32 {
             st.request.move_yaw = st.yaw_to(target);
             st.request.move_level = if walk { 0.5 } else { 1.0 };
             st.request.face_yaw = st.yaw_to(target);
+            RESULT_CONTINUE
+        }
+        NativeGoal::BackToHome => {
+            // BackToHome_With_Parry passes TARGET_ENE_0 as a parameter, but the goal walks to
+            // the initial position. As in FwLo's `src/ai.rs`, it arrives within 1 m, the
+            // distance NonBattleAct accepts as home, measured in 3D as NonBattleAct's
+            // GetMovePointEffectRange does: on the ground plane a foe could stop 1 m off and
+            // still be more than 1 m away in 3D, and NonBattleAct then sent it home again
+            // every tick (the exe's arrival radius is not traced, docs/FIDELITY.md).
+            let home = st.position(POINT_INITIAL).map(glam::Vec3::from_array);
+            let me = glam::Vec3::from_array(st.world.me.position);
+            if home.is_none_or(|h| me.distance(h) <= 1.0) {
+                return RESULT_SUCCESS;
+            }
+            st.request.move_yaw = st.yaw_to(POINT_INITIAL);
+            st.request.move_level = 0.5;
+            st.request.face_yaw = st.request.move_yaw;
             RESULT_CONTINUE
         }
         NativeGoal::Guard => {
@@ -1725,6 +1953,32 @@ fn native_update(st: &mut AiState, id: u32, n: NativeGoal) -> i32 {
             RESULT_CONTINUE
         }
         NativeGoal::Action => action_update(st, id, &g),
+        NativeGoal::ConfirmCaution => {
+            // Activate (FUN_1405c35a0, FwLo's trace): CommonAttack(anim, target, 9999, 180,
+            // 1.5, 20) when the anim is set, then Wait(time, waitTarget).
+            if !g.started_anim {
+                st.goal_mut(id).started_anim = true;
+                let p = |i: usize| g.params.get(i).cloned().unwrap_or(Value::Nil);
+                if g.params
+                    .first()
+                    .and_then(Value::num)
+                    .is_some_and(|a| a >= 0.0)
+                {
+                    let look = [180.0, 1.5, 20.0].map(Value::Num);
+                    let mut a = vec![Value::Num(2200.0), Value::Num(-1.0), p(0), p(1)];
+                    a.push(Value::Num(9999.0));
+                    a.extend(look);
+                    st.add_goal(id, false, &a);
+                }
+                st.add_goal(id, false, &[Value::Num(2000.0), p(2), p(3)]);
+                return RESULT_CONTINUE;
+            }
+            if st.goal(id).subgoals.is_empty() {
+                RESULT_SUCCESS
+            } else {
+                RESULT_CONTINUE
+            }
+        }
         NativeGoal::Unsupported => RESULT_SUCCESS,
     }
 }
@@ -1755,7 +2009,11 @@ fn action_update(st: &mut AiState, id: u32, g: &Goal) -> i32 {
     }
     let playing = st.world.current_anim == Some(action);
     if !g.started_anim {
-        if g.plan_step.is_some()
+        // The plan step can be a table goal (ComboAttackTunableSpin) whose script adds this
+        // CommonAttack, so the step is looked up through the parents.
+        let in_plan = std::iter::successors(Some(g), |g| g.parent.map(|p| st.goal(p)))
+            .any(|g| g.plan_step.is_some());
+        if in_plan
             && st
                 .act_hook
                 .as_ref()
@@ -1874,5 +2132,133 @@ mod counter_choice_tests {
             .unwrap();
         assert_eq!(table.borrow().get(&Value::Num(14.0)).num(), Some(0.0));
         assert_eq!(table.borrow().get(&Value::Num(50.0)).num(), Some(2000.0));
+    }
+}
+
+#[cfg(test)]
+mod goal_slot_tests {
+    use super::*;
+
+    /// A move and the goal it belongs to finish in the same tick; the goal added next takes
+    /// the lowest free slot and its `GetLastResult` reads the Success that slot last stored,
+    /// as a fresh NonBattleAct does after arriving at a patrol point (#116).
+    #[test]
+    fn a_new_goal_reads_the_success_its_slot_last_stored() {
+        let mut st = AiState::new(ThinkParams::default(), HashMap::new(), 1);
+        let mut vm = Vm::new();
+        st.world.dt = 0.1;
+        let top = st.top;
+        // An empty goal (a stand-in for NonBattleAct) with one Wait (2000) child whose life
+        // ends this tick.
+        let act = st.new_goal(-7, -1.0, Vec::new(), Some(top));
+        st.goal_mut(top).subgoals.push_back(act);
+        let wait = st.new_goal(2000, 0.0, vec![Value::Num(-1.0)], Some(act));
+        st.goal_mut(act).subgoals.push_back(wait);
+        let fresh = |st: &mut AiState| {
+            let id = st.new_goal(-7, -1.0, Vec::new(), Some(top));
+            let r = st.goal_method(id, "GetLastResult", &[]).unwrap();
+            st.goals[id as usize] = None;
+            (id, r[0].num())
+        };
+        // Before any update the slot reads the constructor's -1.
+        let (id, before) = fresh(&mut st);
+        assert_eq!((id, before), (3, Some(-1.0)));
+        update(&mut vm, &mut st, top, 0);
+        assert!(st.goals[act as usize].is_none() && st.goals[wait as usize].is_none());
+        let (id, after) = fresh(&mut st);
+        assert_eq!(id, act, "the lowest free slot is reused");
+        assert_eq!(after, Some(f64::from(RESULT_SUCCESS)));
+    }
+
+    /// MoveToSomewhere arrives strictly closer than the goal's distance, plus the AI's own
+    /// radius for the patrol point (103) only, the target whose distance no script reads
+    /// (#114). It used to accept equality.
+    #[test]
+    fn move_to_arrives_strictly_and_adds_the_radius_for_the_patrol_point() {
+        let arrives = |target: i32, gap: f32| {
+            let mut st = AiState::new(ThinkParams::default(), HashMap::new(), 1);
+            st.world.hit_radius = 0.5;
+            st.world.home = [0.0, 0.0, gap];
+            st.patrol = Some(super::super::patrol::Patrol::from_points(
+                0,
+                &[[0.0, 0.0, gap], [5.0, 0.0, 0.0]],
+            ));
+            let params = vec![
+                Value::Num(f64::from(target)),
+                Value::Num(0.0),
+                Value::Num(1.0),
+            ];
+            let id = st.new_goal(2019, -1.0, params, None);
+            native_update(&mut st, id, NativeGoal::MoveTo) == RESULT_SUCCESS
+        };
+        assert!(arrives(103, 1.4));
+        assert!(!arrives(103, 1.5), "the patrol point arrives at its edge");
+        assert!(arrives(100, 0.9));
+        assert!(
+            !arrives(100, 1.0),
+            "the initial position arrives at its edge"
+        );
+        assert!(!arrives(100, 1.4), "the initial position adds the radius");
+    }
+
+    /// A patrol visits every point in order, none skipped (#114): arriving at the current
+    /// point steps the route once, and an update short of the point does not step it.
+    #[test]
+    fn a_patrol_visits_every_point_in_order() {
+        let mut st = AiState::new(ThinkParams::default(), HashMap::new(), 1);
+        st.world.hit_radius = 0.4;
+        let points = [
+            [0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 0.0, 4.0],
+            [0.0, 0.0, 4.0],
+        ];
+        st.patrol = Some(super::super::patrol::Patrol::from_points(0, &points));
+        let mut visited = Vec::new();
+        for _ in 0..8 {
+            let p = st.patrol.as_ref().unwrap();
+            let (cur, at) = (p.current, p.position().unwrap());
+            let params = vec![Value::Num(103.0), Value::Num(0.0), Value::Num(0.0)];
+            let id = st.new_goal(2019, -1.0, params, None);
+            // On the way: 2 m short of the point.
+            st.world.me.position = [at[0], at[1], at[2] - 2.0];
+            assert_eq!(
+                native_update(&mut st, id, NativeGoal::MoveTo),
+                RESULT_CONTINUE
+            );
+            assert_eq!(st.patrol.as_ref().unwrap().current, cur);
+            // There.
+            st.world.me.position = at;
+            assert_eq!(
+                native_update(&mut st, id, NativeGoal::MoveTo),
+                RESULT_SUCCESS
+            );
+            st.goals[id as usize] = None;
+            visited.push(st.patrol.as_ref().unwrap().previous);
+        }
+        assert_eq!(visited, [0, 1, 2, 3, 0, 1, 2, 3]);
+    }
+
+    /// Flags read as the exe's float test `0.0 < param`: Lua booleans, the brain's 1.0/0.0,
+    /// and a negative value is unset.
+    #[test]
+    fn flag_parameters_are_set_only_when_positive() {
+        let mut st = AiState::new(ThinkParams::default(), HashMap::new(), 1);
+        let params = vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Num(1.0),
+            Value::Num(0.0),
+            Value::Num(-1.0),
+        ];
+        let id = st.new_goal(2019, -1.0, params, None);
+        let g = st.goal(id);
+        let flags: Vec<bool> = (0..6).map(|i| g.param_bool(i)).collect();
+        assert_eq!(flags, [true, false, true, false, false, false]);
+        let read = |st: &mut AiState, i: f64| {
+            st.goal_method(id, "GetParam", &[Value::Num(i)]).unwrap()[0].num()
+        };
+        assert_eq!(read(&mut st, 0.0), Some(1.0));
+        assert_eq!(read(&mut st, 1.0), Some(0.0));
     }
 }

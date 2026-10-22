@@ -199,6 +199,29 @@ pub fn chase(rate: f32, dt: f32) -> f32 {
     1.0 - (1.0 - rate).powf(dt * 30.0)
 }
 
+/// How far in front of a wall the follow camera stops (m), and the closest it comes to its
+/// focus. Not traced.
+pub const CAMERA_WALL_MARGIN: f32 = 0.3;
+pub const CAMERA_MIN_DISTANCE: f32 = 0.4;
+
+/// The follow camera's distance from `focus` along `back` (unit, focus to camera), pulled in
+/// front of walls between them: `distance` when nothing is in the way. Shared by the camera on
+/// screen and the hook search's camera (`wire.rs`), so both stand in the same place.
+pub fn wall_pulled_distance(
+    world: &crate::collision::CollisionWorld,
+    focus: Vec3,
+    back: Vec3,
+    distance: f32,
+) -> f32 {
+    world
+        .camera_raycast(focus, back, distance + CAMERA_WALL_MARGIN)
+        .map_or(distance, |hit| {
+            (hit - CAMERA_WALL_MARGIN)
+                .min(distance)
+                .max(CAMERA_MIN_DISTANCE.min(distance))
+        })
+}
+
 /// Matches the facing convention of Character::yaw_to.
 pub fn lock_target_yaw(focus: Vec3, target: Vec3) -> f32 {
     let delta = target - focus;
@@ -610,7 +633,7 @@ mod tests {
 
     #[test]
     fn camera_cache() {
-        let cache = Path::new("../../cache");
+        let cache = &crate::cache::root();
         if cache.join("params/LockCamParam.json").is_file() {
             assert_eq!(CameraParams::load(cache).lock_range, 30.0);
         }
@@ -620,7 +643,7 @@ mod tests {
     /// 4.5 m from a focus 1.5 m above the feet; the other slots name their own rows.
     #[test]
     fn camera_book_slots_name_their_rows() {
-        let cache = Path::new("../../cache");
+        let cache = &crate::cache::root();
         let (pd, _) = param_dirs(cache);
         if !pd.join("CameraSetParam.param").is_file() {
             return;

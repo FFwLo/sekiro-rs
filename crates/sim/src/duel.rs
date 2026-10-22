@@ -256,10 +256,15 @@ pub struct Duel {
     last_safe: Option<([f32; 3], f32)>,
     /// Seconds into the fall return's model fade, after Wolf touched a filter-15 event wall.
     fall_return_fade: Option<f32>,
+    /// The filter-15 wall that started that fade, whose [`HelperEvent`] gets the return; walls
+    /// passed during the fade are only recorded.
+    fall_return_part: Option<String>,
     /// Event wall parts Wolf is in contact with, so one contact is recorded once.
     touching: Vec<String>,
     /// Wolf's contacts with map action event walls (see [`crate::hit_filter`]), oldest first.
     pub helper_events: Vec<HelperEvent>,
+    /// The enemy's fall death (see [`crate::npc_fall`]).
+    pub enemy_fall: crate::npc_fall::NpcFall,
     /// The boss brain choosing the enemy's acts with its Lua AI (see [`crate::brain`]);
     /// `None` leaves the Lua AI alone.
     pub boss_brain: Option<crate::brain::BrainDriver>,
@@ -822,8 +827,10 @@ impl Duel {
             fall_materials: load_fall_materials(cache),
             last_safe: None,
             fall_return_fade: None,
+            fall_return_part: None,
             touching: Vec::new(),
             helper_events: Vec::new(),
+            enemy_fall: Default::default(),
             boss_brain: None,
             god: false,
             immortal: false,
@@ -1087,6 +1094,7 @@ impl Duel {
         let (mut player, mut enemy) = Self::load_characters(&self.cache, 4.0, &self.spec)?;
         std::mem::swap(&mut player.ground, &mut self.player.ground);
         player.docking.edges = std::mem::take(&mut self.player.docking.edges);
+        player.docking.rebuild_links();
         player.wire.points = std::mem::take(&mut self.player.wire.points);
         player.wire.search = self.player.wire.search.clone();
         player.wire.variations = self.player.wire.variations.clone();
@@ -1146,9 +1154,13 @@ impl Duel {
         self.enemy_throw = None;
         self.mikiri = None;
         self.respawn_in = None;
+        // The driver's fight restarts below (an unfinished one ends as such), not as a win.
+        self.idols.arriving = false;
         // A fall return cut short by death must not move the respawned Wolf.
         self.fall_return_fade = None;
+        self.fall_return_part = None;
         self.touching.clear();
+        self.enemy_fall = Default::default();
         self.defender_dying = 0;
         self.last_throw_def_clip = None;
         self.paired_floor = None;
@@ -2892,8 +2904,35 @@ impl Duel {
         })
     }
 
+    /// The enemy's model opacity from its fall death's fade: 1 to 0 over
+    /// [`crate::hit_filter::FALL_RETURN_FADE`] after a filter-15 event wall, else 1.
+    pub fn enemy_fall_opacity(&self) -> f32 {
+        self.enemy_fall.opacity()
+    }
+
+    /// Kills the enemy as the exe's fall-dead routine does for an NPC (see [`crate::npc_fall`]),
+    /// and holds its body once the fade after a filter-15 event wall has ended.
+    fn kill_fallen_enemy(&mut self, before: [f32; 3], dt: f32) {
+        let enemy = &mut self.enemy;
+        let Some(death) = self
+            .enemy_fall
+            .step(&mut enemy.body, &*enemy.ground, before, dt)
+        else {
+            return;
+        };
+        eprintln!(
+            "fall death: {} at {:.2?} ({death:?})",
+            self.spec.chr, enemy.body.position
+        );
+        self.rules.fighters[1].vitality.set_hp(0);
+    }
+
     fn return_fallen_enemy(&mut self) {
-        // Keep the arena's existing NPC boundary reset; material fall death is PC-only.
+        // The arena's NPC boundary reset, for an enemy that has not died of its fall: one that
+        // has stays where it fell (see [`crate::npc_fall`]).
+        if self.enemy_fall.death.is_some() {
+            return;
+        }
         if let Some((depth, spawn)) = self.fall_respawn_depth.zip(self.spawn) {
             let start = spawn[1];
             if self.enemy.body.position[1] < start.position[1] - depth {
@@ -2944,6 +2983,7 @@ impl Duel {
             );
             if fall_return {
                 self.fall_return_fade = Some(0.0);
+                self.fall_return_part = Some(contact.part.clone());
             }
             self.touching.push(contact.part.clone());
             self.helper_events.push(HelperEvent {
@@ -2983,9 +3023,12 @@ impl Duel {
                 .last_safe
                 .or_else(|| self.spawn.map(|s| (s[0].position, s[0].yaw)))
                 .unwrap_or((b.position, b.yaw));
+            let started = self.fall_return_part.take();
             if self.fall_return_fade.take().is_some()
                 && let Some(event) = self.helper_events.iter_mut().rev().find(|e| {
-                    e.hit_filter == crate::hit_filter::FALL_RETURN_FILTER && e.returned_to.is_none()
+                    e.hit_filter == crate::hit_filter::FALL_RETURN_FILTER
+                        && e.returned_to.is_none()
+                        && started.as_ref().is_none_or(|part| *part == e.part)
                 })
             {
                 event.returned_to = Some(position);
@@ -3011,7 +3054,13 @@ impl Duel {
             return;
         }
         let lethal_landing = !was_grounded && b.grounded && {
-            let material = self.player.ground.material(x, z, y + 0.01).unwrap_or(1);
+            // Keyed by HitMtrlParam row, without the material's special setting.
+            let material = self
+                .player
+                .ground
+                .material(x, z, y + 0.01)
+                .and_then(crate::body::hit_mtrl_row)
+                .unwrap_or(1);
             self.fall_materials.get(&material).is_some_and(|m| {
                 m.disable_fall_damage == 0 && b.last_fall_height >= m.fall_death_dist as f32
             })
@@ -3106,6 +3155,8 @@ impl Duel {
         if let Some(t) = self.respawn_in.as_mut() {
             *t -= dt;
             if *t <= 0.0 && self.reset().is_ok() {
+                // A respawn after death restocks the goods as Rest does (docs/FIDELITY.md).
+                self.restock_kit();
                 respawned = true;
             }
         }
@@ -3200,6 +3251,15 @@ impl Duel {
     }
 
     pub fn step(&mut self, input: &InputFrame, dt: f32) -> DuelReport {
+        // The hook search looks through the follow camera as the director left it last step,
+        // as the camera on screen does. A duel sharing the player's frame (a cast actor) does
+        // not own the camera, so it leaves the rig alone.
+        if !self.shared_player_frame {
+            self.player.wire.rig = crate::wire::CameraRig {
+                focus_height: self.camera_director.focus_height,
+                distance: self.camera_director.distance,
+            };
+        }
         let held = self.idol_input(input, dt);
         let input = held.as_ref().unwrap_or(input);
         if self.population.is_some() {
@@ -3434,6 +3494,7 @@ impl Duel {
         {
             self.separate([player_before, enemy_before]);
         }
+        self.kill_fallen_enemy(enemy_before, dt);
         if !self.shared_player_frame {
             self.return_fallen_enemy();
         }

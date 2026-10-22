@@ -11,7 +11,7 @@
 //! Run from the repo root; the install comes from `--game` or `SEKIRO_DIR`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sekiro_fmod::{EventSystem, Played, fight_projects, game_dir};
 use sekiro_sim::arena::{Arena, ArenaSpec, yaw_toward};
@@ -47,7 +47,7 @@ fn outcome(p: Played) -> String {
 }
 
 fn main() {
-    let cache = PathBuf::from("cache");
+    let cache = sekiro_formats::cache::root();
     let seconds: f32 = arg("--seconds")
         .and_then(|s| s.parse().ok())
         .unwrap_or(20.0);
@@ -222,6 +222,7 @@ fn main() {
                 [0.0, 0.0]
             },
             camera_yaw: yaw_toward(p, e),
+            camera_pitch: 0.0,
             buttons,
         };
         let report = duel.step(&frame, dt);

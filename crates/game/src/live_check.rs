@@ -7,7 +7,10 @@
 //! map asset loaded. Once the player can move it samples Wolf at 4 Hz: the collision floor
 //! under him and whether a drawn map triangle lies on it (a ground hole is a grounded sample
 //! with collision but no drawn ground), plus how much of the collision floor within 20 m lies
-//! inside drawn map mesh bounds. Frame times are taken after a settle period.
+//! inside drawn map mesh bounds, and each map foe within 60 m (think row, goal chain, battle
+//! state, LOD, clip, route point and position). Frame times are taken after a settle period. Without a map (`--play` with no
+//! `--map`, the flat-floor fight) samples and stops record Wolf's position, grounded state and
+//! step only.
 //!
 //! `--live-tour x,y,z;x,y,z;...` (or `starts` for every player start of the map) moves Wolf to
 //! each point in turn once play has started, waits three seconds and records a stop sample;
@@ -43,6 +46,8 @@ const GROUND_TOLERANCE: f32 = 1.0;
 const TOUR_WAIT: f32 = 3.0;
 /// Seconds at a `drop:x,y,z` tour stop: a 30 m fall, the fall return's fade and the return.
 const DROP_WAIT: f32 = 8.0;
+/// Map foes within this distance of Wolf are listed in each sample.
+const FOE_RADIUS: f32 = 60.0;
 /// Degrees between `--live-orbit` screenshots.
 const ORBIT_SHOT_DEGREES: f32 = 45.0;
 
@@ -516,7 +521,15 @@ pub(super) fn observe(
             check.longest_start_ms = check.longest_start_ms.max(ms);
         }
     }
-    let Some(collision) = collision else { return };
+    // Without a map (the flat-floor fight) there is no collision or map ground to survey;
+    // samples, stops and the end of the run still work, with position only.
+    let ground = |p: Vec3| match &collision {
+        Some(collision) => {
+            let drawn = drawn_map_meshes(p, SURVEY_RADIUS, &meshes, &parents, &roots);
+            sample_ground(collision, &drawn, &mesh_assets, p)
+        }
+        None => serde_json::json!({ "position": p.to_array() }),
+    };
     let p = Vec3::from_array(sim.duel.player.body.position);
     // Tour: move Wolf to the next point, wait, then sample it.
     if check.sim_started.is_some() && check.tour_index < check.tour.len() {
@@ -524,13 +537,12 @@ pub(super) fn observe(
         let wait = if drop { DROP_WAIT } else { TOUR_WAIT };
         match check.tour_arrived {
             None => {
-                let y = if drop {
-                    target.y
-                } else {
-                    collision
+                let y = match &collision {
+                    Some(collision) if !drop => collision
                         .0
                         .floor(target.x, target.z, target.y + 1.0)
-                        .unwrap_or(target.y)
+                        .unwrap_or(target.y),
+                    _ => target.y,
                 };
                 let body = &mut sim.duel.player.body;
                 body.position = [target.x, y, target.z];
@@ -544,8 +556,7 @@ pub(super) fn observe(
                 sim.duel.helper_events.clear();
             }
             Some(arrived) if arrived.elapsed().as_secs_f32() >= wait => {
-                let drawn = drawn_map_meshes(p, SURVEY_RADIUS, &meshes, &parents, &roots);
-                let mut stop = sample_ground(&collision, &drawn, &mesh_assets, p);
+                let mut stop = ground(p);
                 stop["stop"] = serde_json::json!(check.tour_index);
                 stop["t"] = serde_json::json!(now);
                 stop["grounded"] = serde_json::json!(sim.duel.player.body.grounded);
@@ -578,8 +589,7 @@ pub(super) fn observe(
     }
     check.last_sample = Some(Instant::now());
     check.sampled = true;
-    let drawn = drawn_map_meshes(p, SURVEY_RADIUS, &meshes, &parents, &roots);
-    let mut sample = sample_ground(&collision, &drawn, &mesh_assets, p);
+    let mut sample = ground(p);
     let drawn_ground = sample["ground_drawn"].as_bool() == Some(true);
     if drawn_ground && check.ground_drawn.is_none() {
         check.ground_drawn = Some(now);
@@ -601,6 +611,8 @@ pub(super) fn observe(
     sample["step"] = serde_json::json!(sim.step);
     sample["grounded"] = serde_json::json!(body.grounded);
     let wire = &sim.duel.player.wire;
+    // The wire perch still holding Wolf up, if any (#230: it ends once he leaves it).
+    sample["perch"] = serde_json::json!(wire.perch.map(|p| p.to_array()));
     sample["grapple"] = wire
         .preview
         .as_ref()
@@ -612,6 +624,45 @@ pub(super) fn observe(
                 "can_fire": wire.can_fire(),
             })
         });
+    // Map foes near Wolf: their AI's think row, goal chain and state (battle, target state 0
+    // none / 1 caution / 2 find / 3 battle, the heard AiSoundParam row), scheduling level, the
+    // route point of a patrol and position, to see which stand, walk or fight and why.
+    sample["foes"] = sim
+        .duel
+        .population
+        .as_ref()
+        .map(|population| {
+            population
+                .foes
+                .iter()
+                .filter_map(|foe| {
+                    let at = foe.duel.enemy.body.position;
+                    if Vec3::from_array(at).distance(Vec3::from_array(body.position)) >= FOE_RADIUS
+                    {
+                        return None;
+                    }
+                    let ai = foe.duel.ai.as_ref();
+                    let patrol = ai.and_then(|ai| ai.state.patrol.as_ref());
+                    Some(serde_json::json!({
+                        "part": foe.part,
+                        "think": ai.map(|ai| ai.state.think.id),
+                        "goals": ai.map(|ai| ai.goal_stack().join(">")),
+                        "battle": ai.is_some_and(|ai| ai.state.battle),
+                        "target_state": ai.map(|ai| ai.state.target_state),
+                        "sound": ai.and_then(|ai| ai.state.sound.map(|s| s.id)),
+                        "lod": format!("{:?}", foe.lod),
+                        "clip": foe.report.enemy.animation,
+                        "point": patrol.map(|p| p.current),
+                        "previous": patrol.map(|p| p.previous),
+                        "at": at,
+                        "hp": foe.duel.rules.fighters[1].vitality.hp,
+                        "fall_death": foe.duel.enemy_fall.death.as_ref().map(|d| format!("{d:?}")),
+                        "opacity": foe.duel.enemy_fall_opacity(),
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .into();
     info!("live check: sample {sample}");
     check.samples.push(sample);
     // The last stop's screenshot is written before the run ends.

@@ -408,6 +408,8 @@ pub fn play_blocks(cache: &Path, id: &str) -> Result<BTreeMap<String, Value>> {
 /// Physics bootstrap uses the same bounded block inventory as rendering ([`play_blocks`]).
 /// Collision/group records remain separate in MapWorld; only the broad-phase query
 /// mesh is concatenated, without adding MapOffset or translating any vertex.
+/// Each block's mesh is the low-resolution `l` collision characters and the camera collide
+/// with (`sekiro_sim::lo_collision`, #189), or its `collision.bin` when it has none (logged).
 /// Collision parts and placed objects the block's `story` switches off are left out.
 /// Helper parts the player does not collide with (`sekiro_sim::hit_filter`) leave the
 /// walkable mesh and join the world as camera-only triangles or event walls.
@@ -420,18 +422,17 @@ pub fn collision_world(
     let mut helpers = sekiro_sim::hit_filter::HelperCollision::default();
     let mut story_off = 0;
     for (block, layout) in layouts {
-        let path = cache.join("maps").join(block).join("collision.bin");
-        if path.is_file() {
-            let mut part = CollisionMesh::from_bytes(&std::fs::read(path)?)?;
-            // Before the helpers, so a switched-off helper part does not come back as one.
-            if let Some(story) = story.maps.get(block) {
-                story_off +=
-                    sekiro_sim::arenas_a::remove_hidden_collision(&mut part, layout, |n| {
-                        story.switched_off(n)
-                    });
-            }
-            helpers.extend(sekiro_sim::hit_filter::strip_helpers(&mut part, layout));
-            mesh.extend(&part);
+        let dir = cache.join("maps").join(block);
+        // A block exports `collision_lo.bin` beside `collision.bin`, never alone.
+        if dir.join(sekiro_sim::lo_collision::HIGH_FILE).is_file() {
+            let story = story.maps.get(block);
+            let part = sekiro_sim::lo_collision::block_collision(&dir, layout, |n| {
+                story.is_some_and(|s| s.switched_off(n))
+            })
+            .map_err(anyhow::Error::msg)?;
+            story_off += part.story_off;
+            helpers.extend(part.helpers);
+            mesh.extend(&part.mesh);
         }
     }
     eprintln!(
@@ -447,6 +448,22 @@ pub fn collision_world(
         // 20005560 are on only while Wolf has SpEffect 4100 (stands on a rideable object),
         // whatever the story says: they hold only riders (#119).
         let story = story.maps.get(block);
+        // The fall-prevention assist walls of the block's collision parts, those of parts the
+        // story switches off left out with them (#149).
+        let walls = world
+            .add_map_fall_assist(&cache.join("maps").join(block), |n| {
+                story.is_none_or(|s| !s.switched_off(n))
+            })
+            .map_err(anyhow::Error::msg)?;
+        // Only a block whose `f` binder was unpacked but never exported is missing walls; one
+        // without the binder has none, nor do parts the story has switched off.
+        let binder = cache.join(format!("raw/map/{block}/f{}.hkxbhd", &block[1..]));
+        if walls.is_none() && binder.is_file() {
+            eprintln!(
+                "collision: {block}: no fall-assist walls (re-export with `sekiro-extract map \
+                 {block} --fall-assist`)"
+            );
+        }
         let groups =
             sekiro_sim::hit_filter::load_ride_wall_groups(cache, block).unwrap_or_else(|e| {
                 eprintln!("collision: {block}: no ride wall groups: {e}");
@@ -498,11 +515,30 @@ impl MapWorld {
         let mut blocks = BTreeMap::new();
         for (id, json) in neighbourhood(cache)? {
             let dir = cache.join("maps").join(&id);
-            let collision = if dir.join("collision.bin").is_file() {
-                CollisionMesh::from_bytes(&std::fs::read(dir.join("collision.bin"))?)?
-            } else {
-                CollisionMesh::default()
-            };
+            // The draw groups follow the part the player's capsule stands on, so the parts are
+            // read from the `l` mesh it collides with (#189), each part's range from
+            // `collision_lo.bin`; a block without one falls back to `collision.bin` and the
+            // layout's ranges ([`sekiro_sim::lo_collision::read`]).
+            let (collision, low_ranges) =
+                match sekiro_sim::lo_collision::read_low(&dir).map_err(anyhow::Error::msg)? {
+                    Some(low) => {
+                        let ranges: BTreeMap<String, (usize, usize)> = low
+                            .parts
+                            .iter()
+                            .map(|p| (p.name.clone(), (p.first as usize, p.count as usize)))
+                            .collect();
+                        (low.mesh, Some(ranges))
+                    }
+                    None => {
+                        let high = dir.join(sekiro_sim::lo_collision::HIGH_FILE);
+                        let mesh = if high.is_file() {
+                            CollisionMesh::from_bytes(&std::fs::read(high)?)?
+                        } else {
+                            CollisionMesh::default()
+                        };
+                        (mesh, None)
+                    }
+                };
             let mut collisions = Vec::new();
             for row in json["parts"]
                 .as_array()
@@ -510,11 +546,22 @@ impl MapWorld {
                 .flatten()
                 .filter(|r| r["kind"] == "Collision")
             {
-                let Some(range) = row["triangles"].as_array() else {
-                    continue;
+                let (first, count) = match &low_ranges {
+                    // A part with no `l` model is met by no character (an empty range).
+                    Some(ranges) => row["name"]
+                        .as_str()
+                        .and_then(|n| ranges.get(n))
+                        .copied()
+                        .unwrap_or((0, 0)),
+                    None => {
+                        let Some(range) = row["triangles"].as_array() else {
+                            continue;
+                        };
+                        let first = range.first().and_then(Value::as_u64).unwrap_or(0) as usize;
+                        let count = range.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
+                        (first, count)
+                    }
                 };
-                let first = range.first().and_then(Value::as_u64).unwrap_or(0) as usize;
-                let count = range.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
                 let Some(indices) = collision.indices.get(first * 3..(first + count) * 3) else {
                     anyhow::bail!("{id}: collision triangle range is invalid");
                 };
@@ -1244,8 +1291,20 @@ fn detail_requests(part: &DetailPart, distance: f32, weights: [f32; 3]) -> [bool
     requested
 }
 
+/// [`update_detail`]'s per-thread finds: parts whose level weights or readiness changed, and
+/// level scenes to request.
+#[derive(Default)]
+pub(crate) struct DetailScratch {
+    changed: bevy::utils::Parallel<Vec<(Entity, f32, DetailApplied)>>,
+    requests: bevy::utils::Parallel<Vec<(bool, f32, Entity, usize)>>,
+}
+
 fn prioritize_detail_requests(requests: &mut Vec<(bool, f32, Entity, usize)>) {
-    requests.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+    requests.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+            .then_with(|| (a.2, a.3).cmp(&(b.2, b.3)))
+    });
     let demanded = requests.partition_point(|r| !r.0);
     requests.truncate(demanded + DETAIL_SCENES_PER_FRAME);
 }
@@ -1279,16 +1338,14 @@ pub(crate) fn update_detail(
         ),
         Without<Camera3d>,
     >,
-    mut slots: Query<(
-        &mut Visibility,
-        &mut DetailWeight,
-        Option<&WorldAssetRoot>,
-        Option<&WorldInstance>,
-    )>,
+    mut slots: Query<(&mut Visibility, &mut DetailWeight)>,
+
+    roots: Query<(Option<&WorldAssetRoot>, Option<&WorldInstance>)>,
     children: Query<&Children>,
     meshes: Query<Option<&MeshTag>, With<Mesh3d>>,
     wolf: Query<&Transform, (With<PlayerFocus>, Without<Camera3d>)>,
     mut debug: Local<Option<bool>>,
+    mut found: Local<DetailScratch>,
 ) {
     let _timer = crate::perf_log::SystemTimer::start("update_detail");
     let Some(camera) = cameras.iter().next() else {
@@ -1296,77 +1353,104 @@ pub(crate) fn update_detail(
     };
     let debug = *debug.get_or_insert_with(|| std::env::args().any(|a| a == "--lod-debug"));
     let wolf = wolf.iter().next().map(|t| t.translation);
-    let mut requests = Vec::new();
-    for (part_entity, transform, identity, msb, mut part) in &mut parts {
-        let distance =
-            super::lod::bounds_distance(camera.translation, transform, part.min, part.max);
-        let rule = part.rule;
-        let scales = part.scales;
-        let available = part.available;
-        let mut state = part.state;
-        let weights = if groups.mode == GroupMode::Off {
-            let mut weights = [0.; 3];
-            if let Some(first) = available.iter().position(|&v| v) {
-                weights[first] = 1.;
-            }
-            weights
-        } else {
-            state.update(rule, scales, distance, time.delta_secs(), available)
-        };
-        crate::change::set(&mut part, |p| &mut p.state, state);
-        let selected = dominant(weights);
-        // Every level with weight gets its scene, so a crossfade's incoming level exists before
-        // it dominates. Every level lives in the same GLB, so once the stream has requested it
-        // the scene comes from that load; before then the current level stays, keeping the
-        // stream's order and in-flight limit.
-        let wanted = if part.stream.is_none()
-            || part
-                .available
-                .iter()
-                .zip(part.spawned)
-                .all(|(&exists, spawned)| !exists || spawned)
-        {
-            [false; 3]
-        } else if groups.mode == GroupMode::Off {
-            weights.map(|w| w > 0.)
-        } else {
-            detail_requests(&part, distance, weights)
-        };
-        for (level, &wanted) in wanted.iter().enumerate() {
-            if wanted
-                && !part.spawned[level]
-                && part.slots[level].is_some()
-                && part
-                    .stream
-                    .and_then(|index| pending.requested(index))
-                    .is_some()
-            {
-                requests.push((weights[level] == 0., distance, part_entity, level));
-            }
-        }
-        // A level is ready once its scene has spawned its meshes, so a switch never leaves a
-        // gap. Capture scenes are spawned synchronously.
-        let ready: [bool; 3] = std::array::from_fn(|level| {
-            weights[level] > 0.
-                && part.slots[level].is_some_and(|entity| {
-                    part.stream.is_none()
-                        || slots.get(entity).is_ok_and(|(_, _, root, instance)| {
-                            root.is_some()
-                                && instance.is_some_and(|i| instances.instance_is_ready(**i))
+    let groups_off = groups.mode == GroupMode::Off;
+    let delta = time.delta_secs();
+    // Every part's distance, weights and scene readiness, on all cores: a castle frame walks
+    // over 10,000 parts, and on one thread this took about 2 ms of the main schedule (#70).
+    // Only parts whose levels must change come back for the writes below.
+    let DetailScratch { changed, requests } = &mut *found;
+    {
+        let pending = &*pending;
+        parts
+            .par_iter_mut()
+            .for_each(|(part_entity, transform, _, _, mut part)| {
+                let distance =
+                    super::lod::bounds_distance(camera.translation, transform, part.min, part.max);
+                let available = part.available;
+                let mut state = part.state;
+                let weights = if groups_off {
+                    let mut weights = [0.; 3];
+                    if let Some(first) = available.iter().position(|&v| v) {
+                        weights[first] = 1.;
+                    }
+                    weights
+                } else {
+                    state.update(part.rule, part.scales, distance, delta, available)
+                };
+                crate::change::set(&mut part, |p| &mut p.state, state);
+                // Every level with weight gets its scene, so a crossfade's incoming level
+                // exists before it dominates. Every level lives in the same GLB, so once the
+                // stream has requested it the scene comes from that load; before then the
+                // current level stays, keeping the stream's order and in-flight limit.
+                let wanted = if part.stream.is_none()
+                    || part
+                        .available
+                        .iter()
+                        .zip(part.spawned)
+                        .all(|(&exists, spawned)| !exists || spawned)
+                {
+                    [false; 3]
+                } else if groups_off {
+                    weights.map(|w| w > 0.)
+                } else {
+                    detail_requests(&part, distance, weights)
+                };
+                for (level, &wanted) in wanted.iter().enumerate() {
+                    if wanted
+                        && !part.spawned[level]
+                        && part.slots[level].is_some()
+                        && part
+                            .stream
+                            .and_then(|index| pending.requested(index))
+                            .is_some()
+                    {
+                        requests.borrow_local_mut().push((
+                            weights[level] == 0.,
+                            distance,
+                            part_entity,
+                            level,
+                        ));
+                    }
+                }
+                // A level is ready once its scene has spawned its meshes, so a switch never
+                // leaves a gap. Capture scenes are spawned synchronously.
+                let ready: [bool; 3] = std::array::from_fn(|level| {
+                    weights[level] > 0.
+                        && part.slots[level].is_some_and(|entity| {
+                            part.stream.is_none()
+                                || roots.get(entity).is_ok_and(|(root, instance)| {
+                                    root.is_some()
+                                        && instance
+                                            .is_some_and(|i| instances.instance_is_ready(**i))
+                                })
                         })
-                })
-        });
-        // Settled levels still check distance and scene readiness, but need no slot writes.
-        // Finish clearing a fade's mesh tags before taking this path.
-        let applied = DetailApplied {
-            weights,
-            ready,
-            slots: part.slots,
-            stream: part.stream,
-        };
-        if !part.fading && part.applied.as_ref() == Some(&applied) {
+                });
+                // Settled levels still check distance and scene readiness, but need no slot
+                // writes. Finish clearing a fade's mesh tags before taking this path.
+                let applied = DetailApplied {
+                    weights,
+                    ready,
+                    slots: part.slots,
+                    stream: part.stream,
+                };
+                if part.fading || part.applied.as_ref() != Some(&applied) {
+                    changed
+                        .borrow_local_mut()
+                        .push((part_entity, distance, applied));
+                }
+            });
+    }
+    let mut changed_parts = Vec::new();
+    changed.drain_into(&mut changed_parts);
+    // The threads' finds come back in no fixed order.
+    changed_parts.sort_unstable_by_key(|(entity, _, _)| *entity);
+    for (part_entity, distance, applied) in changed_parts {
+        let Ok((_, transform, identity, msb, mut part)) = parts.get_mut(part_entity) else {
             continue;
-        }
+        };
+        let (weights, ready) = (applied.weights, applied.ready);
+        let rule = part.rule;
+        let selected = dominant(weights);
         part.applied = Some(applied);
         if part.shown != selected && ready[selected] {
             part.shown = selected;
@@ -1385,7 +1469,7 @@ pub(crate) fn update_detail(
             let Some(entity) = *entity else {
                 continue;
             };
-            if let Ok((mut visibility, mut weight, _, _)) = slots.get_mut(entity) {
+            if let Ok((mut visibility, mut weight)) = slots.get_mut(entity) {
                 let desired = if tags[level].is_some() {
                     Visibility::Inherited
                 } else {
@@ -1441,6 +1525,8 @@ pub(crate) fn update_detail(
     }
     // Current demand wins over speculative warm-up, then nearest bounds first. Deferred
     // requests are reconsidered next frame, so movement cannot leave a stale backlog.
+    let mut requests = Vec::new();
+    found.requests.drain_into(&mut requests);
     prioritize_detail_requests(&mut requests);
     for (_, _, entity, level) in requests {
         let (_, _, _, _, mut part) = parts.get_mut(entity).expect("queried detail part");
@@ -1787,7 +1873,7 @@ mod tests {
 
     #[test]
     fn installed_neighbourhood_keeps_blocks_and_baked_transforms() {
-        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         if !cache.join("maps/m11_01_00_00/layout.json").is_file() {
             return;
         }
@@ -1920,12 +2006,14 @@ mod tests {
     /// teleport re-arms the spawn probe even in the air.
     #[test]
     fn standing_part_survives_the_branch_and_follows_teleports() {
-        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         if !cache.join("maps/m11_01_00_00/layout.json").is_file() {
             return;
         }
         let mut world = MapWorld::load(&cache, ASHINA[0], "maps/m11_00_00_00/").unwrap();
-        let ledge = Vec3::new(-132.5, -44.6, -124.0);
+        // On the ledge's part `h023300` 6 m north of where `h` has its lip at (-132.5, -44.6,
+        // -124.0): `l`'s hull there is a slope too steep to stand on (#189).
+        let ledge = Vec3::new(-136.5, -42.54, -118.0);
         // Both ends of the branch: the user's perch and the one the live check's grapple
         // reaches from the ledge.
         let perches = [
@@ -1956,9 +2044,15 @@ mod tests {
 
         // The viewer's camera probe over the ravine finds only zero-demand helper walls.
         world.demand(&[perches[0]], None);
-        assert_eq!(
-            world.selected,
-            Some((ASHINA[0].to_string(), "h900000".to_string()))
+        // `l`'s hulls of the two walls overlap differently from `h`'s, so either may be first.
+        assert!(
+            world
+                .selected
+                .as_ref()
+                .is_some_and(|(block, part)| block == ASHINA[0]
+                    && ["h900000", "h900001"].contains(&part.as_str())),
+            "{:?}",
+            world.selected
         );
         assert_eq!(world.blocks[ASHINA[0]].normal, [0; 8]);
 
@@ -2051,7 +2145,7 @@ mod tests {
         static WORLD: std::sync::OnceLock<Option<PlayWorld>> = std::sync::OnceLock::new();
         WORLD
             .get_or_init(|| {
-                let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+                let cache = sekiro_sim::cache::root();
                 if !cache
                     .join("maps/m11_00_00_00/object_collision.bin")
                     .is_file()
@@ -2343,7 +2437,7 @@ mod tests {
     /// 6 m above the ground there. Left in, Wolf ran into them and stood on them in mid-air.
     #[test]
     fn story_switched_off_collision_parts_hold_no_one() {
-        let cache = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         if !cache.join("maps/m11_00_00_00/collision.bin").is_file() {
             return;
         }
@@ -2357,5 +2451,23 @@ mod tests {
         // Inside h003401's footprint, 5.7 m above the courtyard: the floor is the ground.
         let floor = world.floor(-212.0, -1.0, -20.0).expect("courtyard ground");
         assert!((floor + 40.5).abs() < 0.3, "floor at {floor}");
+    }
+
+    /// The live play check's own spawns (`tests/it/live_play.rs`: the grapple ledge and the
+    /// trunk walk's lower ground) stand over the play collision; a spawn over a hole makes the
+    /// game refuse to start (#231), which only that slow, ignored test would otherwise show.
+    #[test]
+    fn live_check_spawns_stand_on_the_play_collision() {
+        let Some(p) = play_world() else { return };
+        for (name, [x, y, z], ground) in [
+            ("grapple", [-136.5, -42.54, -118.0], -42.54),
+            ("trunk", [-140.0, -50.0, -132.0], -50.78),
+        ] {
+            let floor = p.world.floor(x, z, y + 1.0);
+            assert!(
+                floor.is_some_and(|f| (f - ground).abs() < 0.1),
+                "{name} spawn ({x}, {y}, {z}): floor {floor:?}, expected {ground}"
+            );
+        }
     }
 }

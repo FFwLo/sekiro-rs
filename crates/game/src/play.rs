@@ -59,6 +59,10 @@ mod game_menu;
 mod idol;
 #[path = "idol_found.rs"]
 mod idol_found;
+#[path = "idol_rest.rs"]
+mod idol_rest;
+#[path = "idol_travel.rs"]
+mod idol_travel;
 #[path = "live_check.rs"]
 mod live_check;
 #[path = "map_enemies.rs"]
@@ -134,6 +138,12 @@ pub struct Options {
     /// Time of day (hours) and draw param override for the map lighting.
     pub hour: f32,
     pub gparam: Option<String>,
+    /// Start at this idol (BonfireWarpParam `bonfireEntityId`) of `map`, at its warp point:
+    /// how Travel to an idol on another map arrives (`--at-idol`).
+    pub at_idol: Option<i32>,
+    /// What Wolf carries, has learned and found, carried over from the run that travelled
+    /// here (`--kit`, JSON).
+    pub kit: Option<sekiro_sim::kit::Kit>,
     /// A boss arena (`--arena owl`): the boss's map, his MSB placement and Wolf's start;
     /// replaces `map` and `start`.
     pub arena: Option<&'static ArenaSpec>,
@@ -211,8 +221,9 @@ fn renderer_counts(
     materials: Res<Assets<StandardMaterial>>,
     layered: crate::map::MaterialStats,
     fx: Res<crate::fxr::FxrPlayer>,
-    lighting: Res<crate::lighting::MapLighting>,
-    probe: Res<crate::perf_log::RenderProbe>,
+    // Map-only (`MapLighting`) and `--perf`-only (`RenderProbe`) resources.
+    lighting: Option<Res<crate::lighting::MapLighting>>,
+    probe: Option<Res<crate::perf_log::RenderProbe>>,
     mut last: Local<usize>,
 ) {
     if sim.step == 0 || sim.step % 60 != 59 || *last == sim.step {
@@ -230,8 +241,8 @@ fn renderer_counts(
         cameras.iter().count(),
         rigs.iter().count(),
         fx.live_counts(),
-        lighting.hour,
-        probe.0.lock().map_or(0, |p| p.draw_batches)
+        lighting.map_or(f32::NAN, |l| l.hour),
+        probe.map_or(0, |p| p.0.lock().map_or(0, |p| p.draw_batches))
     );
 }
 
@@ -312,6 +323,30 @@ struct Sim {
     faded: [bool; 2],
     /// Seconds since a perilous-attack warning last reached Wolf, for the kanji.
     perilous_age: Option<f32>,
+}
+
+#[cfg(test)]
+impl Sim {
+    /// `duel` with no script, no foe and nothing shown yet, for system tests.
+    fn for_test(duel: Duel) -> Self {
+        Self {
+            duel,
+            last: Default::default(),
+            started: [None, None],
+            hit_log: Vec::new(),
+            script: None,
+            route: ScriptRoute::default(),
+            step: 0,
+            lock_requested: false,
+            break_posture: false,
+            passive: true,
+            enemy_present: false,
+            previous: [([0.; 3], 0.); 2],
+            clock: [0.; 2],
+            faded: [false; 2],
+            perilous_age: None,
+        }
+    }
 }
 
 fn apply_perf_tour(
@@ -456,7 +491,9 @@ pub fn run(options: Options) -> Result<()> {
     let mut stories = map::story::MapStory::default();
     let mut start_yaw = 0.0;
     let mut idols = idol::Idols::default();
-    let mut has_pickups = false;
+    // The item params, shared by the sim (pickups, Storage, restock) and the game menu.
+    let item_data = pickup::item_data(&cache);
+    let mut pickups = Vec::new();
     let mut within = None;
     let mut fog_walls = Vec::new();
     if let Some(spec) = options.arena {
@@ -517,15 +554,24 @@ pub fn run(options: Options) -> Result<()> {
         stage("collision world");
         idols = idol::Idols::load(&cache, &blocks, |x, z, y| world.floor(x, z, y + 1.0));
         duel.set_idols(idols.spots.clone());
-        let (pickups, item_data) = pickup::load(&cache, &blocks);
-        has_pickups = !pickups.is_empty();
-        duel.set_pickups(pickups, item_data);
-        let (start, yaw_degrees) = match options.spawn {
-            Some([x, y, z, yaw]) => {
+        pickups = pickup::load(&cache, &blocks, &item_data);
+        let at_idol = options.at_idol.and_then(|e| {
+            let i = idols.index(e);
+            if i.is_none() {
+                warn!("--at-idol {e}: no such idol on {id}");
+            }
+            i
+        });
+        let (start, yaw_degrees) = match (at_idol, options.spawn) {
+            (Some(i), _) => {
+                let p = idols.spots[i].checkpoint;
+                (Vec3::from(p.position), p.yaw.to_degrees())
+            }
+            (None, Some([x, y, z, yaw])) => {
                 let y = world.floor(x, z, y + 1.0).unwrap_or(y);
                 (Vec3::new(x, y, z), yaw)
             }
-            None => map::player_start(&dir, options.start)?,
+            (None, None) => map::player_start(&dir, options.start)?,
         };
         let yaw = yaw_degrees.to_radians();
         start_yaw = yaw;
@@ -536,6 +582,9 @@ pub fn run(options: Options) -> Result<()> {
             options.enemy_distance,
             |x, z, near| world.floor(x, z, near + 1.0).unwrap_or(near),
         );
+        if let Some(i) = at_idol {
+            duel.start_at_idol(i);
+        }
         duel.player.ground = Box::new(world.clone());
         duel.enemy.ground = Box::new(sekiro_sim::collision::EnemyGround(world.clone()));
         // Placeholder until the map's authored void return volumes are decoded.
@@ -549,6 +598,17 @@ pub fn run(options: Options) -> Result<()> {
         on_map = Some((dir, id.clone(), world));
         map::raise_io_stack();
     }
+    if let Some((_, id, world)) = &on_map {
+        require_floor(duel.player.body.position, |x, z, top| {
+            world.floor(x, z, top)
+        })
+        .with_context(|| format!("{id}: Wolf's start"))?;
+    }
+    if let Some(kit) = &options.kit {
+        duel.kit = kit.clone();
+    }
+    let has_pickups = !pickups.is_empty();
+    duel.set_pickups(pickups, item_data.clone());
     if let Some((dir, _, _)) = &on_map
         && dir.join("edges.json").exists()
     {
@@ -828,7 +888,7 @@ pub fn run(options: Options) -> Result<()> {
     );
     crate::menu::install(&mut app);
     // First of the screens, so its extra menu atlases load with theirs in one read.
-    game_menu::install(&mut app, options.attack_power.value());
+    game_menu::install(&mut app, options.attack_power.value(), item_data);
     crate::death_screen::install(&mut app);
     idol::install(&mut app, idols);
     pickup::install(&mut app, has_pickups);
@@ -1133,7 +1193,20 @@ fn setup(
     ));
 }
 
-/// Two lights and a checkered floor, so movement and speed are visible off the map.
+/// Fails when no collision floor lies under `position`, as `floor(x, z, top)` finds it from
+/// 1 m above. The play gate waits for that floor before play starts, and neither the collision
+/// world nor Wolf changes while loading, so a start over a hole (a `--spawn` whose ground moved,
+/// #231) would hold the loading screen forever.
+fn require_floor(position: [f32; 3], floor: impl Fn(f32, f32, f32) -> Option<f32>) -> Result<()> {
+    let [x, y, z] = position;
+    if floor(x, z, y + 1.0).is_none() {
+        anyhow::bail!(
+            "no collision floor under ({x:.2}, {y:.2}, {z:.2}); play would never start (pick a --spawn over the map's ground)"
+        );
+    }
+    Ok(())
+}
+
 /// Puts Wolf at `start` facing `yaw` and the enemy `distance` metres in front of him, facing
 /// him, both on the floor `floor_at(x, z, near_y)` finds.
 fn place_pair(
@@ -1155,6 +1228,7 @@ fn place_pair(
     enemy.fall_top = enemy.position[1];
 }
 
+/// Two lights and a checkered floor, so movement and speed are visible off the map.
 fn spawn_floor_stage(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -1273,6 +1347,7 @@ fn gather_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     held: Res<crate::menu::HeldThroughMenu>,
+    modal: Option<Res<crate::menu::Modal>>,
     gamepads: Query<&Gamepad>,
     orbit: Res<Orbit>,
     mut live: ResMut<LiveInput>,
@@ -1292,11 +1367,12 @@ fn gather_input(
         capture.focus_requested = true;
     }
     // A click while the cursor is free (after Esc) takes the mouse back for the camera; that
-    // click is not an attack.
+    // click is not an attack. Not while a screen over the game (the idol menu) has the mouse.
     if !mouse.pressed(MouseButton::Left) {
         capture.grab_click = false;
     }
     if mouse.just_pressed(MouseButton::Left)
+        && !modal.is_some_and(|m| m.0)
         && let Ok((window, mut c)) = windows.single_mut()
         && window.focused
         && window.cursor_position().is_some()
@@ -1332,6 +1408,7 @@ fn gather_input(
     live.frame = InputFrame {
         move_stick: [stick.x, stick.y],
         camera_yaw: orbit.yaw,
+        camera_pitch: orbit.pitch,
         buttons: b,
     };
 }
@@ -1429,10 +1506,7 @@ fn simulate(
             && sim.duel.spec.chr == "c7100"
             && (sim.step < 60 || std::env::var("PF_RESPAWN_PROBE").is_ok_and(|v| v == "tomoe-each"))
         {
-            let cache = PathBuf::from(
-                crate::arg_value(&std::env::args().collect::<Vec<_>>(), "--cache")
-                    .unwrap_or_else(|| "cache".into()),
-            );
+            let cache = sekiro_sim::cache::root();
             let tomoe = sekiro_sim::enemy::EnemySpec::from_cache(&cache, "c7110:71100000")
                 .expect("probe Tomoe");
             sim.duel.spec = tomoe;
@@ -1445,18 +1519,26 @@ fn simulate(
     let route = script_ended
         .then(|| sim.route.steer(Vec2::new(feet[0], feet[2])))
         .flatten();
+    // The step's camera is the orbit's yaw and pitch (the last frame's, as on screen): the hook
+    // search builds its camera from them and the simulation's own body and camera director, so
+    // it does not depend on frame timing.
     let mut frame = match (&sim.script, route) {
         // The route's stick direction is already in world space.
-        (_, Some(f)) => f,
-        (Some(frames), None) => {
-            // Scripted sticks are camera-relative to the current orbit, like a player's.
-            let mut f = frames.get(sim.step).copied().unwrap_or_default();
-            f.camera_yaw += orbit.yaw;
-            f
-        }
+        (_, Some(f)) => InputFrame {
+            camera_pitch: orbit.pitch,
+            ..f
+        },
+        // Scripted sticks are camera-relative to the current orbit, like a player's, its yaw and
+        // pitch columns turning that camera (`InputFrame::from_camera`).
+        (Some(frames), None) => frames
+            .get(sim.step)
+            .copied()
+            .unwrap_or_default()
+            .from_camera(orbit.yaw, orbit.pitch),
         // The stick is relative to the camera on screen now (the orbit of the last frame).
         (None, None) => InputFrame {
             camera_yaw: orbit.yaw,
+            camera_pitch: orbit.pitch,
             ..live.frame
         },
     };
@@ -1475,7 +1557,6 @@ fn simulate(
     if sim.passive {
         sim.duel.enemy_active = false;
     }
-    sim.duel.player.wire.view_pitch = orbit.pitch;
     let cinematic_applied = sim.duel.cinematic.as_ref().is_some_and(|c| c.applied);
     let mut report = sim.duel.step(&frame, dt);
     if std::env::var_os("PF_RESPAWN_PROBE").is_some() && sim.step % 60 == 30 {
@@ -2001,13 +2082,10 @@ fn follow_camera(
     let target = orbit.focus;
     let rot = Quat::from_euler(EulerRot::YXZ, orbit.yaw, -orbit.pitch, 0.0);
     let back = rot * Vec3::Z;
-    let mut distance = orbit.distance;
-    // Pull the camera in front of walls between it and Wolf.
-    if let Some(c) = collision
-        && let Some(hit) = c.0.camera_raycast(target, back, orbit.distance + 0.3)
-    {
-        distance = (hit - 0.3).clamp(0.4, orbit.distance);
-    }
+    // Pull the camera in front of walls between it and Wolf (as the hook search's camera is).
+    let distance = collision.map_or(orbit.distance, |c| {
+        sekiro_sim::camera::wall_pulled_distance(&c.0, target, back, orbit.distance)
+    });
     let eye = target + back * distance;
     *tf = Transform::from_translation(eye).looking_at(target, Vec3::Y);
 }
@@ -2327,11 +2405,7 @@ impl ScriptRoute {
                 self.next += 1;
                 continue;
             }
-            return Some(InputFrame {
-                move_stick: [0.0, 0.3],
-                camera_yaw: (-d.x).atan2(-d.y),
-                ..InputFrame::default()
-            });
+            return Some(InputFrame::toward_world_yaw((-d.x).atan2(-d.y), 0.3));
         }
         None
     }
@@ -2637,6 +2711,19 @@ mod tests {
     use sekiro_sim::fight::FighterKind;
 
     #[test]
+    fn a_start_over_a_hole_fails_instead_of_loading_forever() {
+        // Ground only west of x = -134 and no higher than -42.5, like the Outskirts ledge.
+        let floor = |x: f32, _z: f32, top: f32| (x < -134.0 && top >= -42.5).then_some(-42.5);
+        assert!(require_floor([-136.5, -42.54, -118.0], floor).is_ok());
+        let err = require_floor([-132.3, -42.0, -123.9], floor).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no collision floor under (-132.30, -42.00, -123.90)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn default_keys_crouch_lock_on_and_use_the_prosthetic() {
         let held = |k| k == KeyCode::KeyQ || k == KeyCode::ControlLeft;
         let (_, b) = keyboard_input(held, |m| m == MouseButton::Middle);
@@ -2679,7 +2766,7 @@ mod tests {
 
     #[test]
     fn no_enemy_rejects_lock_and_contacts_without_restarting_wolf() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let mut duel = Duel::load(&cache, 4.).unwrap();
         duel.use_simple_ai();
         let start = duel.player.body.position;
@@ -2733,27 +2820,11 @@ mod tests {
 
     #[test]
     fn explore_hud_hides_enemy_and_debug_text_but_f3_toggles_player_details() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let mut duel = Duel::load(&cache, 4.).unwrap();
         duel.use_simple_ai();
         vacant_enemy_slot(&mut duel);
-        let sim = Sim {
-            duel,
-            last: Default::default(),
-            started: [None, None],
-            hit_log: Vec::new(),
-            script: None,
-            route: ScriptRoute::default(),
-            step: 0,
-            lock_requested: false,
-            break_posture: false,
-            passive: true,
-            enemy_present: false,
-            previous: [([0.; 3], 0.); 2],
-            clock: [0.; 2],
-            faded: [false; 2],
-            perilous_age: None,
-        };
+        let sim = Sim::for_test(duel);
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .insert_non_send(sim)
@@ -2806,7 +2877,7 @@ mod tests {
 
     #[test]
     fn enemy_head_follows_the_head_bone_over_the_root() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let Ok(mut lib) = AnimLibrary::load(&cache, "c1010") else {
             eprintln!("skipping: cache not extracted");
             return;
@@ -2828,7 +2899,7 @@ mod tests {
 
     #[test]
     fn castle_restart_restores_phase_one_story_lighting() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let arena = ArenaSpec::by_name("genichiro").unwrap();
         let phase = arena.enemy_spec();
         let mut duel = Duel::load_with(&cache, 6., phase).unwrap();
@@ -2873,7 +2944,7 @@ mod tests {
     /// full hit stop types (his own are 0, as the Owl's), so Wolf's slash freezes both.
     #[test]
     fn drawn_clip_time_holds_through_hit_stop() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         if !cache.join("raw/chr/c1010.behbnd.d/c9997.hkx").exists() {
             eprintln!("skipping: cache not extracted");
             return;

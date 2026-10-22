@@ -102,11 +102,12 @@ fn castle_deathblow_open_floor() {
 }
 
 fn castle_case(case: &str) {
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
-    if !cache.join("maps/m11_01_00_00/collision.bin").exists() {
+    let Some(cache) = crate::movement_helpers::cache()
+        .filter(|cache| cache.join("maps/m11_01_00_00/collision.bin").exists())
+    else {
         eprintln!("skipping: castle map not extracted");
         return;
-    }
+    };
     let spec = ArenaSpec::by_name("genichiro").unwrap();
     let arena = Arena::load(&cache, spec, false).unwrap();
     let mut duel = Duel::load_with(&cache, 1.6, spec.enemy_spec()).unwrap();
@@ -236,13 +237,20 @@ fn castle_case(case: &str) {
         hit |= r.deathblow.hit;
         let positions = [duel.player.body.position, duel.enemy.body.position];
         if case == "open" && r.deathblow.hit {
-            // Recorded before this fix, using these installed clips and this setup.
-            // Open-floor horizontal placement must remain unchanged for both actors.
+            // Open-floor horizontal placement must remain unchanged for both actors:
+            // the collision-safe pair placement must not move a pair that has room.
+            // Re-recorded after 86b8434 (#109): its RustSekiro root-motion blend-in and
+            // approach-side body separation start the pair 0.17 m further apart before
+            // the deathblow, so the hit lands about 0.35 m from the f99e8b7 values
+            // ([106.79679, 230.90317], [107.11729, 229.8592]); the pair placement did not change.
             for (p, expected) in positions
                 .iter()
-                .zip([[106.79679, 230.90317], [107.11729, 229.8592]])
+                .zip([[106.65166, 231.23984], [106.91727, 230.15114]])
             {
-                assert!((p[0] - expected[0]).hypot(p[2] - expected[1]) < 0.002);
+                assert!(
+                    (p[0] - expected[0]).hypot(p[2] - expected[1]) < 0.002,
+                    "open-floor hit position {p:?}, expected x/z {expected:?}"
+                );
             }
         }
         writeln!(

@@ -10,7 +10,7 @@ use super::runtime::AiEvent;
 use super::{AiActor, AiBrain, AiWorld, ThinkParams};
 
 fn cache() -> Option<PathBuf> {
-    let c = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let c = crate::cache::root();
     c.join("raw/script/aicommon.luabnd.d").is_dir().then_some(c)
 }
 
@@ -32,6 +32,34 @@ fn every_ai_chunk_parses() {
         if e.path().extension().is_some_and(|x| x == "lua") {
             load_chunk(&std::fs::read(e.path()).unwrap())
                 .unwrap_or_else(|err| panic!("{}: {err}", e.path().display()));
+            n += 1;
+        }
+    }
+    assert!(n > 90, "{n}");
+}
+
+/// The patrol steps only in the move goal on arrival at POINT_MOVE_POINT (#114) because no
+/// shipped AI script calls `StepNextMovePoint`; NonBattleAct and RouteMove read the stepped
+/// route back (GetPrevMovePointNumber, IsRouteEnd) after the move succeeds. A script that
+/// did call it would step the route a second time per point.
+#[test]
+fn no_ai_script_steps_the_patrol_itself() {
+    let Some(cache) = cache() else { return };
+    let mut n = 0;
+    for luabnd in std::fs::read_dir(cache.join("raw/script"))
+        .unwrap()
+        .flatten()
+    {
+        if !luabnd.path().is_dir() || !luabnd.file_name().to_string_lossy().ends_with(".luabnd.d") {
+            continue;
+        }
+        for e in std::fs::read_dir(luabnd.path()).unwrap().flatten() {
+            let data = std::fs::read(e.path()).unwrap();
+            assert!(
+                !data.windows(17).any(|w| w == b"StepNextMovePoint"),
+                "{} calls StepNextMovePoint",
+                e.path().display()
+            );
             n += 1;
         }
     }

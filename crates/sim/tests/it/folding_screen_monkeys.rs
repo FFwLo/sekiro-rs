@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use sekiro_formats::anim::Skeleton;
 use sekiro_sim::{Character, InputFrame, registry::Registry};
 
@@ -11,7 +9,7 @@ fn folding_screen_monkeys_hidden_target_is_playable_from_arena_start() {
         arena::{Arena, ArenaSpec},
         duel::Duel,
     };
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     if !cache.join("anim/c1250/skeleton.bin").exists()
         || !cache.join("maps/m20_00_00_00/collision.bin").exists()
     {
@@ -30,6 +28,7 @@ fn folding_screen_monkeys_hidden_target_is_playable_from_arena_start() {
         let report = duel.step(
             &InputFrame {
                 camera_yaw,
+                camera_pitch: 0.0,
                 move_stick: if tick < 270 { [0.0, 0.6] } else { [0.0, 0.0] },
                 buttons: Buttons {
                     attack: (30..270).contains(&tick) && (tick - 30) % 8 == 0,
@@ -110,7 +109,7 @@ fn folding_screen_monkeys_independent_lua_following_and_bell() {
         arena::{Arena, ArenaSpec},
         duel::Duel,
     };
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     if !cache.join("anim/c1250/skeleton.bin").exists()
         || !cache.join("maps/m20_00_00_00/collision.bin").exists()
     {
@@ -268,7 +267,7 @@ fn folding_screen_monkeys_four_combat_deaths_drive_map_victory() {
         arena::{Arena, ArenaSpec},
         duel::Duel,
     };
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     if !cache.join("anim/c1250/skeleton.bin").exists()
         || !cache.join("maps/m20_00_00_00/collision.bin").exists()
     {
@@ -339,7 +338,7 @@ fn folding_screen_monkeys_four_combat_deaths_drive_map_victory() {
 /// would silently leave all four actors motionless even with their models extracted.
 #[test]
 fn folding_screen_monkeys_load_the_placed_animation_donor() {
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     if !cache.join("maps/m20_00_00_00/layout.json").exists()
         || !cache.join("anim/c1250/skeleton.bin").exists()
     {
@@ -411,7 +410,7 @@ fn folding_screen_monkeys_apparition_runs_its_own_lua_after_a_screen_death() {
         arena::{Arena, ArenaSpec},
         duel::Duel,
     };
-    let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+    let cache = sekiro_sim::cache::root();
     if !cache.join("anim/c1250/skeleton.bin").exists()
         || !cache.join("maps/m20_00_00_00/collision.bin").exists()
     {

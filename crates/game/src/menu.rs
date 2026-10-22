@@ -9,6 +9,112 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 static NEXT: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// The flags with a value that a relaunch from a run carries over (Back to start menu, Travel
+/// to an idol on another map): the cache, the window, the player, the brain and its coach,
+/// and the time of day. One-shot automation (`--script`, `--input`, `--shots`, `--exit`,
+/// `--perf-seconds`, ...) and the run's own place (`--map`, `--start`, `--spawn`, `--arena`,
+/// `--enemy`) stay behind.
+pub(crate) const KEPT_VALUES: &[&str] = &[
+    "--cache",
+    "--window-size",
+    "--present-mode",
+    "--volume",
+    "--vram-budget",
+    "--menu-choices",
+    "--player",
+    "--attack-power",
+    "--progression",
+    "--hour",
+    "--story",
+    "--brain",
+    "--brain-model",
+    "--brain-memory",
+    "--brain-stage",
+    "--brain-budget",
+    "--brain-token-budget",
+    "--coach",
+    "--coach-model",
+    "--coach-effort",
+    "--coach-interval",
+    "--checkpoint",
+    "--brain-moves",
+    "--brain-move-every",
+    "--coach-review-every",
+    "--shadow",
+    "--shadow-casters",
+    "--shadow-bias",
+    "--local-light-scale",
+];
+
+/// The switches a relaunch from a run carries over: play and its enemies, the cheats and
+/// brain switches, the frame pacing, the perf log and the render and debug toggles.
+pub(crate) const KEPT_SWITCHES: &[&str] = &[
+    "--play",
+    "--perf",
+    "--profile-systems",
+    "--uncapped",
+    "--no-enemy",
+    "--passive",
+    "--map-enemies",
+    "--simple-ai",
+    "--god",
+    "--immortal",
+    "--lock-on",
+    "--break-posture",
+    "--brain-log",
+    "--brain-overlay",
+    "--objects",
+    "--no-connected-blocks",
+    "--no-cloth",
+    "--no-fxr",
+    "--no-fog",
+    "--no-fog-surfaces",
+    "--no-shadow",
+    "--no-bloom",
+    "--no-auto-exposure",
+    "--no-grading",
+    "--no-giiv",
+    "--no-sky-dome",
+    "--no-far-scenery",
+    "--no-env-probe",
+    "--no-map-story",
+    "--no-local-lights",
+    "--no-layers",
+    "--no-camera-fade",
+    "--no-arena-effects",
+    "--no-pieces",
+    "--legacy-camera-fade",
+    "--native-tone-filmic",
+    "--native-tone-reinhard",
+    "--lod-debug",
+    "--world-debug",
+    "--visibility-debug",
+    "--show-blend",
+    "--visual-stats",
+    "--probe-sky",
+];
+
+/// The flags of `args` a relaunch from a run keeps ([`KEPT_VALUES`] with their values,
+/// [`KEPT_SWITCHES`]), in their order; everything else is dropped.
+pub(crate) fn kept_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut args = args.iter();
+    while let Some(a) = args.next() {
+        if KEPT_VALUES.contains(&a.as_str()) {
+            if let Some(v) = args.next() {
+                out.extend([a.clone(), v.clone()]);
+            }
+        } else if KEPT_SWITCHES.contains(&a.as_str()) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+/// Starts the game again with `args` once this run exits ([`relaunch`]).
+pub(crate) fn relaunch_with(args: Vec<String>) {
+    *NEXT.lock().unwrap() = Some(args);
+}
 pub fn relaunch() -> anyhow::Result<()> {
     if let Some(args) = NEXT.lock().unwrap().take() {
         std::process::Command::new(std::env::current_exe()?)
@@ -150,7 +256,7 @@ mod tests {
         for args in [&mut menu, &mut cli] {
             args.extend([
                 "--cache".into(),
-                root.join("cache").to_string_lossy().into_owned(),
+                sekiro_sim::cache::root().to_string_lossy().into_owned(),
             ]);
         }
         let a = crate::play_options_with(&menu, &root.join("logs/datasets")).unwrap();
@@ -298,7 +404,7 @@ mod tests {
                 "--play".into(),
                 flag.into(),
                 "--cache".into(),
-                root.join("cache").to_string_lossy().into_owned(),
+                sekiro_sim::cache::root().to_string_lossy().into_owned(),
             ];
             let options = crate::play_options_with(&args, &root.join("logs/datasets")).unwrap();
             assert_eq!(
@@ -310,7 +416,7 @@ mod tests {
     }
     #[test]
     fn explore_options_cover_every_extracted_map_with_first_visit_defaults() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         for id in MAPS {
             let Ok(dir) = crate::map::map_dir(&cache, id) else {
                 continue;
@@ -341,7 +447,7 @@ mod tests {
     }
     #[test]
     fn map_changes_reset_start_and_start_selection_wraps_authored_points() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let mut choices = Choices::default();
         for id in MAPS {
             let Ok(dir) = crate::map::map_dir(&cache, id) else {
@@ -380,7 +486,7 @@ mod tests {
     }
     #[test]
     fn explore_keyboard_shortcuts_and_navigation_use_live_menu_system() {
-        let cache = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cache");
+        let cache = sekiro_sim::cache::root();
         let mut legacy = Choices::default();
         legacy.values[3] = "m11_01".into();
         let args = vec![
@@ -1607,22 +1713,7 @@ fn update(
                         "--menu-choices".into(),
                         serde_json::to_string(&state.choices.values).unwrap(),
                     ];
-                    for flag in [
-                        "--window-size",
-                        "--present-mode",
-                        "--cache",
-                        "--checkpoint",
-                        "--brain-moves",
-                        "--brain-move-every",
-                        "--coach-review-every",
-                    ] {
-                        if let Some(value) = crate::arg_value(&state.extras, flag) {
-                            args.extend([flag.into(), value]);
-                        }
-                    }
-                    if state.extras.iter().any(|a| a == "--uncapped") {
-                        args.push("--uncapped".into());
-                    }
+                    args.extend(kept_args(&state.extras));
                     if let Some(script) = &state.return_script {
                         args.extend(["--menu-script".into(), script.clone()]);
                     }
