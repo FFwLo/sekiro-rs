@@ -234,7 +234,7 @@ fn after(app: &mut App) {
         Ok((world, blocks, warp))
     })();
     // Wolf's start: the idol's warp point, else the camera's spot (its floor below).
-    let (mut at, mut warp) = (None, None);
+    let (mut at, mut warp, mut collision) = (None, None, None);
     match world {
         Ok((w, blocks, i)) => {
             edges(app, &blocks);
@@ -243,7 +243,9 @@ fn after(app: &mut App) {
                 at = w.floor_hit(x, z, y).map(|(h, _)| Vec3::new(x, h, z));
             }
             warp = i;
-            rustsekiro::Terrain::from_world(Arc::new(World::new(w))).install();
+            let w = World::new(w);
+            collision = Some(w.0.clone());
+            rustsekiro::Terrain::from_world(Arc::new(w)).install();
         }
         Err(e) => warn!("rustsekiro: no collision ({e}); a flat floor"),
     }
@@ -274,7 +276,7 @@ fn after(app: &mut App) {
         .insert_resource(rustsekiro::SoundPlace { source_map: map.clone(), sound_space: 0, space: rustsekiro::MapSpace::Absolute })
         .init_resource::<crate::map_fx::FoundIdols>()
         .add_systems(Update, (mark_camera, light_idols));
-    wire(app, &cache, &map);
+    wire(app, &cache, &map, collision);
 }
 
 /// sekiro-rs's grapple for the combat's Wolf: its hook search (`sekiro_sim::wire::Wire::search`,
@@ -287,9 +289,11 @@ struct HisWire {
     body: sekiro_sim::body::Body,
 }
 
-fn wire(app: &mut App, cache: &std::path::Path, map: &str) {
-    let loaded = crate::map::map_dir(cache, map)
-        .and_then(|dir| sekiro_sim::wire::Wire::load(cache, &dir).map_err(anyhow::Error::msg));
+/// `collision`: the play world the hooks are aimed through (placed objects block the wire).
+fn wire(app: &mut App, cache: &std::path::Path, map: &str, collision: Option<Arc<sekiro_sim::collision::CollisionWorld>>) {
+    let loaded = collision
+        .ok_or_else(|| anyhow::anyhow!("no collision"))
+        .and_then(|world| crate::map::map_dir(cache, map).and_then(|dir| sekiro_sim::wire::Wire::load(cache, &dir, world).map_err(anyhow::Error::msg)));
     match loaded {
         Ok(wire) => {
             info!("rustsekiro: sekiro-rs's grapple, {} hooks", wire.points.len());
