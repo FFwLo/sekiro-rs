@@ -59,6 +59,7 @@ mod perf_log;
 mod pipeline_warmup;
 mod play;
 mod presentation;
+mod rustsekiro_mode;
 #[cfg(feature = "profile-spans")]
 mod span_profile;
 mod split_sun_cascades;
@@ -160,6 +161,10 @@ fn dispatch() -> anyhow::Result<()> {
             combat: args.iter().any(|a| a == "--combat"),
         };
         return viewer::run(options);
+    }
+    // RustSekiro's combat on the map (rustsekiro_mode.rs).
+    if let Some(dir) = arg_value(&args, "--rustsekiro") {
+        rustsekiro_mode::install(&args, PathBuf::from(dir))?;
     }
     if let Some(id) = arg_value(&args, "--map")
         && !args.iter().any(|a| a == "--play")

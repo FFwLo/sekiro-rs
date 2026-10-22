@@ -1037,6 +1037,9 @@ pub fn run(options: Options) -> Result<()> {
 
     raise_io_stack();
     let mut app = App::new();
+    // A game hosted on the map (APP_HOOKS) has its own camera and controls: no fly camera, no
+    // viewer keys or markers, no wireframe.
+    let hosted = APP_HOOKS.get().is_some();
     if let Some((before, _)) = APP_HOOKS.get() {
         before(&mut app);
     }
@@ -1066,15 +1069,17 @@ pub fn run(options: Options) -> Result<()> {
             }),
         FrameTimeDiagnosticsPlugin::default(),
         bevy::render::diagnostic::RenderDiagnosticsPlugin,
-        // Only the viewer can show the collision wireframe (`--collision`, C). Play and sweeps
-        // never do, and the plugin's per-frame specialization check over every mesh cost
-        // about 1.8 ms of the main thread in the castle (#70).
-        WireframePlugin::default(),
     ))
     // Keep rendering at full rate when the window is not focused, so screenshots and
     // `--uncapped` measurements from a terminal are not throttled to 60 Hz.
     .insert_resource(bevy::winit::WinitSettings::continuous())
     .insert_resource(upload_budget());
+    // Only the viewer can show the collision wireframe (`--collision`, C). Play, sweeps and a
+    // hosted game never do, and the plugin's per-frame specialization check over every mesh cost
+    // about 1.8 ms of the main thread in the castle (#70).
+    if !hosted {
+        app.add_plugins(WireframePlugin::default());
+    }
     add_map(
         &mut app,
         &dir,
@@ -1089,7 +1094,7 @@ pub fn run(options: Options) -> Result<()> {
             hide: options.hide,
             objects: options.objects || world::enabled(&options.id),
             groups: options.groups,
-            markers: true,
+            markers: !hosted,
             hour: options.hour,
             gparam: options.gparam,
             within: None,
@@ -1110,9 +1115,11 @@ pub fn run(options: Options) -> Result<()> {
     })
     .add_systems(Startup, move |commands: Commands| {
         setup_view(commands, start)
-    })
-    .add_systems(Update, (fly, apply_fly, hud).chain())
-    .add_systems(Update, (toggle_collision, cycle_groups.before(pick_groups)));
+    });
+    if !hosted {
+        app.add_systems(Update, (fly, apply_fly, hud).chain())
+            .add_systems(Update, (toggle_collision, cycle_groups.before(pick_groups)));
+    }
     if let Some(path) = options.screenshot {
         if path.exists() {
             std::fs::remove_file(&path)?;

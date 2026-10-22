@@ -38,3 +38,8 @@ opt-level = 3
 
 [profile.release]
 debug = 1
+
+# RustSekiro's core names this repo's crates by their git source: build it on these.
+[patch."https://github.com/AKJama/sekiro-rs"]
+sekiro-formats = { path = "crates/formats" }
+sekiro-hks = { path = "crates/hks" }

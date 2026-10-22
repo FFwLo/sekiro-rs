@@ -5055,6 +5055,7 @@ dependencies = [
  "cpal",
  "dasp_sample",
  "hound",
+ "lewton",
  "num-rational",
  "thiserror 2.0.21",
  "tracing",
@@ -5283,6 +5284,7 @@ dependencies = [
  "sekiro-formats",
  "sekiro-sim",
  "serde_json",
+ "sv1",
  "tracing",
  "wgpu",
  "windows",
@@ -5532,6 +5534,19 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "sv1"
+version = "0.2.1"
+dependencies = [
+ "bevy",
+ "libloading",
+ "sekiro-formats",
+ "sekiro-hks",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "swash"

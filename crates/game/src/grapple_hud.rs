@@ -10,17 +10,17 @@ use sekiro_sim::wire::MarkerState;
 use std::path::Path;
 
 #[derive(Component)]
-pub(super) struct Marker;
+pub(crate) struct Marker;
 #[derive(Component)]
-pub(super) struct Fill;
+pub(crate) struct Fill;
 #[derive(Component)]
-pub(super) struct Cursor;
+pub(crate) struct Cursor;
 
 /// Normalized radius = central dot radius + authored disc expansion * fill.
 const REVEAL_CURVE: Vec2 = Vec2::new(0.11, 0.39);
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-pub(super) struct WireFill {
+pub(crate) struct WireFill {
     /// fill, texture width in texels, central radius, radial expansion.
     #[uniform(0)]
     pub settings: Vec4,
@@ -36,13 +36,23 @@ impl UiMaterial for WireFill {
     }
 }
 
-pub(super) fn plugin(app: &mut App) {
+pub(crate) fn plugin(app: &mut App) {
     embedded_asset!(app, "grapple_hud.wesl");
-    app.add_plugins(UiMaterialPlugin::<WireFill>::default());
+    app.add_plugins(UiMaterialPlugin::<WireFill>::default())
+        .init_resource::<Preview>();
 }
 
+/// The hook the marker shows: the best hook of the wire search (`Wire::preview`), filled by
+/// the play from its sim or by a game hosted on the map from its own Wolf.
+#[derive(Resource, Default)]
+pub(crate) struct Preview(pub Option<sekiro_sim::wire::Target>);
+
+/// The camera the marker is placed through.
+#[derive(Component)]
+pub(crate) struct HudCamera;
+
 #[derive(Resource)]
-pub(super) struct Sprites {
+pub(crate) struct Sprites {
     ready: Handle<Image>,
     distance: Handle<Image>,
     ready_ring: Handle<Image>,
@@ -51,7 +61,7 @@ pub(super) struct Sprites {
 }
 
 impl Sprites {
-    pub(super) fn ring(&self, state: MarkerState) -> Handle<Image> {
+    pub(crate) fn ring(&self, state: MarkerState) -> Handle<Image> {
         if state == MarkerState::Ready {
             self.ready_ring.clone()
         } else {
@@ -59,7 +69,7 @@ impl Sprites {
         }
     }
 
-    pub(super) fn draw(
+    pub(crate) fn draw(
         &self,
         state: MarkerState,
         material: &mut bevy::asset::AssetMut<'_, WireFill>,
@@ -75,7 +85,7 @@ impl Sprites {
     }
 }
 
-pub(super) fn spawn(
+pub(crate) fn spawn(
     commands: &mut Commands,
     cache: &Path,
     images: &mut Assets<Image>,
@@ -167,4 +177,81 @@ pub(super) fn spawn(
             ));
         });
     commands.insert_resource(sprites);
+}
+
+/// Places the marker over [`Preview`]'s hook: the ring (ready or distant), the distance fill and,
+/// for a hook that is not ridden, the arrow.
+#[allow(clippy::type_complexity)]
+pub(crate) fn marker(
+    preview: Res<Preview>,
+    cameras: Query<(&Camera, &GlobalTransform), With<HudCamera>>,
+    mut markers: Query<(&mut Node, &mut ImageNode), With<Marker>>,
+    sprites: Option<Res<Sprites>>,
+    mut materials: ResMut<Assets<WireFill>>,
+    mut cursors: Query<
+        &mut Node,
+        (
+            With<Cursor>,
+            Without<Fill>,
+            Without<Marker>,
+        ),
+    >,
+    mut fills: Query<
+        (&mut Node, &MaterialNode<WireFill>),
+        (With<Fill>, Without<Marker>),
+    >,
+) {
+    use crate::change::set;
+    let Ok((mut node, mut image)) = markers.single_mut() else {
+        return;
+    };
+    let Some(target) = preview.0.as_ref() else {
+        set(&mut node, |n| &mut n.display, Display::None);
+        return;
+    };
+    let Ok((camera, transform)) = cameras.single() else {
+        set(&mut node, |n| &mut n.display, Display::None);
+        return;
+    };
+    let state = target.state;
+    let Ok(p) = camera.world_to_viewport(transform, Vec3::from_array(target.point.to_array()))
+    else {
+        set(&mut node, |n| &mut n.display, Display::None);
+        return;
+    };
+    let Some(sprites) = sprites else { return };
+    set(&mut node, |n| &mut n.display, Display::Flex);
+    // At 1440p the ring sprite box is 66 px (the distance sprite's native size);
+    // its visible outer diameter is about 49 px. Scale with the viewport height.
+    let size = sprites.base_size * crate::combat_hud::viewport_size(Some(camera)).y / 1440.0;
+    set(&mut node, |n| &mut n.width, px(size.x));
+    set(&mut node, |n| &mut n.height, px(size.y));
+    set(&mut node, |n| &mut n.left, px(p.x - size.x * 0.5));
+    set(&mut node, |n| &mut n.top, px(p.y - size.y * 0.5));
+    set(&mut image, |i| &mut i.image, sprites.ring(state));
+    if let Ok((mut inner, handle)) = fills.single_mut() {
+        set(
+            &mut inner,
+            |n| &mut n.display,
+            if state == sekiro_sim::wire::MarkerState::Ready && !target.rideable {
+                Display::None
+            } else {
+                Display::Flex
+            },
+        );
+        if let Some(mut material) = materials.get_mut(&handle.0) {
+            sprites.draw(state, &mut material);
+        }
+    }
+    if let Ok(mut cursor) = cursors.single_mut() {
+        set(
+            &mut cursor,
+            |n| &mut n.display,
+            if target.rideable {
+                Display::None
+            } else {
+                Display::Flex
+            },
+        );
+    }
 }

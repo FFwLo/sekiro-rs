@@ -73,7 +73,7 @@ mod pickup;
 mod play_gate;
 pub(crate) use play_gate::{PlayGate, fraction};
 #[path = "grapple_hud.rs"]
-mod grapple_hud;
+pub(crate) mod grapple_hud;
 #[path = "rope.rs"]
 mod rope;
 
@@ -874,7 +874,7 @@ pub fn run(options: Options) -> Result<()> {
             follow_camera,
             crate::brain_overlay::update,
             hud,
-            grapple_marker,
+            (wire_preview, grapple_hud::marker).chain(),
             (
                 combat_hud::update,
                 combat_hud::update_status,
@@ -1112,6 +1112,7 @@ fn setup(
     rope::spawn(&mut commands, &assets, &rope_cache.0, model_path.0);
     commands.spawn((
         FollowCamera,
+        grapple_hud::HudCamera,
         Camera3d::default(),
         bevy::core_pipeline::prepass::DepthPrepass,
         bevy::core_pipeline::prepass::MotionVectorPrepass,
@@ -2630,79 +2631,9 @@ fn sheath_sword(
     }
 }
 
-#[allow(clippy::type_complexity)]
-fn grapple_marker(
-    sim: NonSend<Sim>,
-    cameras: Query<(&Camera, &GlobalTransform), With<FollowCamera>>,
-    mut markers: Query<(&mut Node, &mut ImageNode), With<grapple_hud::Marker>>,
-    sprites: Option<Res<grapple_hud::Sprites>>,
-    mut materials: ResMut<Assets<grapple_hud::WireFill>>,
-    mut cursors: Query<
-        &mut Node,
-        (
-            With<grapple_hud::Cursor>,
-            Without<grapple_hud::Fill>,
-            Without<grapple_hud::Marker>,
-        ),
-    >,
-    mut fills: Query<
-        (&mut Node, &MaterialNode<grapple_hud::WireFill>),
-        (With<grapple_hud::Fill>, Without<grapple_hud::Marker>),
-    >,
-) {
-    use crate::change::set;
-    let Ok((mut node, mut image)) = markers.single_mut() else {
-        return;
-    };
-    let Some(target) = sim.duel.player.wire.preview.as_ref() else {
-        set(&mut node, |n| &mut n.display, Display::None);
-        return;
-    };
-    let Ok((camera, transform)) = cameras.single() else {
-        set(&mut node, |n| &mut n.display, Display::None);
-        return;
-    };
-    let state = target.state;
-    let Ok(p) = camera.world_to_viewport(transform, Vec3::from_array(target.point.to_array()))
-    else {
-        set(&mut node, |n| &mut n.display, Display::None);
-        return;
-    };
-    let Some(sprites) = sprites else { return };
-    set(&mut node, |n| &mut n.display, Display::Flex);
-    // At 1440p the ring sprite box is 66 px (the distance sprite's native size);
-    // its visible outer diameter is about 49 px. Scale with the viewport height.
-    let size = sprites.base_size * combat_hud::viewport_size(Some(camera)).y / 1440.0;
-    set(&mut node, |n| &mut n.width, px(size.x));
-    set(&mut node, |n| &mut n.height, px(size.y));
-    set(&mut node, |n| &mut n.left, px(p.x - size.x * 0.5));
-    set(&mut node, |n| &mut n.top, px(p.y - size.y * 0.5));
-    set(&mut image, |i| &mut i.image, sprites.ring(state));
-    if let Ok((mut inner, handle)) = fills.single_mut() {
-        set(
-            &mut inner,
-            |n| &mut n.display,
-            if state == sekiro_sim::wire::MarkerState::Ready && !target.rideable {
-                Display::None
-            } else {
-                Display::Flex
-            },
-        );
-        if let Some(mut material) = materials.get_mut(&handle.0) {
-            sprites.draw(state, &mut material);
-        }
-    }
-    if let Ok(mut cursor) = cursors.single_mut() {
-        set(
-            &mut cursor,
-            |n| &mut n.display,
-            if target.rideable {
-                Display::None
-            } else {
-                Display::Flex
-            },
-        );
-    }
+/// The hook the wire HUD shows: Wolf's search preview.
+fn wire_preview(sim: NonSend<Sim>, mut preview: ResMut<grapple_hud::Preview>) {
+    preview.0 = sim.duel.player.wire.preview.clone();
 }
 
 #[cfg(test)]
