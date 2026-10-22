@@ -101,7 +101,9 @@ Effect lights reuse a bounded pool of sixteen entities and the existing scene-to
 
 Action 10000 has a bounded CPU implementation using the authored texture, colour, size variation, velocity variation, emission volume, follow factor and duration fields.
 The integer emission/duration fields are interpreted on the FXR 30 Hz clock; the native GPU scheduler's exact count semantics remain unverified.
-The 2048-particle per-node bound can reduce dense weather emission.
+Each node keeps at most 2048 particles; when the steady population (count per emission times emissions per lifetime) is larger, every emission is thinned by the same fraction so the population stays steady (#84).
+The camera snow 839500 wants 40 flakes every 1/30 s for 6 s (7200), so it keeps about 28 percent of them.
+Before #84 the pool filled in 1.7 s and then emitted nothing until that batch expired, so a running Wolf left the snow behind for about two seconds in every six.
 This fallback does not yet reproduce GPU collision, all emitter shapes, random turns, angular motion or every acceleration/growth field.
 Camera-follow detection comes from native node movement 46 in the FXR tree, including effect references.
 
@@ -303,6 +305,26 @@ If the user's reference was taken with 8302 set, the reference shows those effec
 Whether 8302 should be on for the afternoon story state is a decision in `map_story.rs`, which the story-state agent owns; no edit was made there.
 The flame sprites of 800140 were short for the same direction reason as the brazier (see "Flame height").
 
+## Point-light falloff distance (#141), 2026-10-22
+
+The map item glint (FFX 61) lit a warm pool about 1.5 m wide on the ground; the real game shows a small glow.
+The earlier trace above that `b = 1/R` was wrong.
+In both builders (`388130` point, `3892e0` spot) the diffuse w at offset 0x4c is `DAT_14328919c (1.0) / object[+0x90]`, while the radius is object `+0x19c` (stored as `1/R^2` in the position w).
+The light base constructor `20d5f0` sets `+0x90` to 1.0.
+For FXR 609 lights `+0x90` is taken to be the property `unk_ds3_p2_0`: across all 744 installed 609 lights it is a distance tied to the radius (R/2 or R/4 in most, for example R 3.75 with 1.875, R 2.5 with 0.625), and it is the only property that fits; the FXR writer of `+0x90` itself was not found within the time-box, so this mapping is inferred, not traced.
+The glint has R 1.5 and falloff 0.25, so its `1 / (1 + 0.7 (d/0.25)^2)` term drops to 0.26 at 0.5 m and 0.08 at 1 m, where `b = 1/R` gave 0.86 and 0.76.
+`fxr.rs` now reads the falloff and passes it in Bevy's `PointLight::radius`; `native_clustered_light` uses it for `b` when it is positive.
+BTL lights keep radius 0 and therefore `b = 1/R`; which BTL field feeds `+0x90` is not traced.
+Fire lights also fall off faster now (brazier 839530: R 5, falloff 0.625; ground fire 800140: R 5, falloff 1.25), so `NATIVE_POINT_LIGHT_UNEXPLAINED_RESIDUAL`, fitted by eye with `b = 1/R`, may need refitting at spot-022 and spot-056.
+The other unused 609 fields do not explain the pool: `adaptationExponent` (0.6 here) scales by `2^(-rate * EV)` with EV 0 in shipped builds, `volumeDensity` is read only in the volumetric scattering pass, and the flicker (`flickerBrightness` 0.5 every 2 to 2.5 s) only lowers the mean; flicker is still not modelled.
+Live check at Item_宝_02 (`--hour 1`): mean pixel value of the lantern base 1 m from the item fell from 108 to 53 and of the plants from 123 to 52 (ambient), and the item itself from 193 to 118.
+Fire check at spot-022 (ground fire 800140, `--hour 1`, mean red): the ground at the fire went from 223 to 140, the ground between the fire and Wolf from 167 to 55, the dark side stayed at 28 to 26.
+A real-game shot of the same fire (hour unknown, regions matched roughly) reads 176, 71 and 43, so the pool-to-dark ratio is now 5.4 and 2.1 against the reference's 4.1 and 1.65, where before it was 7.9 and 5.9.
+The residual is left unchanged: the remaining gap is mostly our darker ambient (26 against 43), and the reference does not clearly support a refit.
+The light radius also feeds Bevy's sphere-light model, but only its specular (roughness widening and a solid-angle term); diffuse uses the light centre.
+Map pieces and characters (both `LayeredMaterial` with `NATIVE_DIRECT`, on by default) subtract Bevy's own point-light term with the same radius and add the native one, so it cancels there.
+Only plain `StandardMaterial` meshes (blood decals, debug markers, the arena floor) see it: for the glint (radius 0.25) at 1 m with roughness 0.7 the specular peak drops to 0.63 of a point light with a wider lobe, which is not visible.
+
 ## Flame height and rising sparks, 2026-10-15
 
 Symptom: the brazier (spot-056, FXR 839530) and the ground fire 800140 had short, low flames and no rising sparks, although the sprite sizes matched the data.
@@ -319,9 +341,21 @@ The cause was the emission direction, in two places.
    It was read as local forward (+Z).
    The torch effect 300163 (sparks with gravity -1 and a 5.6 degree cone, no node rotation) and the flame cores of 839530 only make sense if 6 is world up, so it is now the world up axis whatever the node tilt.
    Directions 1 to 5 are unchanged.
+   Superseded by #60 below: 6 is local north.
 
 Result at spot-056: the flame rises about 0.5 m above the coals with sparks above it, as in the reference (the coals themselves are still dark).
 At the 800140 pile the flames are about 1 m tall, which is what the data gives (height 1 to 2 times scale 0.56, plus 0.375 m/s for 1.5 s).
 Disc emitters (shape 401) still emit radially for direction 0; with the corrected rotation the 800140 smoke discs now rise through gravity and speed, the radial default is unverified.
 Open: spark sprites (width 0.05 times 0.56, texture 3000, rgb multiplier 15) are still fainter and fewer than in the reference, possibly a minimum screen size or bloom difference in the game.
 
+## Emitter direction, 2026-10-22 (#60)
+
+Symptom: at start 3 (beside the stone wall) and on the path toward the first gate, "ground steam" shot straight up, fast.
+The effect is the blowing snow 839543 (region `SFX:吹き込む雪_ID839543_1000`, near start 3) and its twin 839542 (between starts 1 and 2).
+Its streak nodes emit 16 particles every 0.2 s from a 5 x 0.25 x 1 m box at 8.3 m/s (movement 64), with direction 6 and a slight upward gravity.
+With direction 6 read as world up, a headless step measured them rising at 9.3 m/s mean and up to 67 m/s.
+The InitialDirection enum (reference/fxr, as FwLo's RustSekiro `docs/kb/fxr.md` and `src/fxr.rs` read it) is 0 by shape, 1 / 2 global up / down, 3 global north, 4 / 5 local up / down and 6 local north (the node's +Z).
+`emit_point` now follows it: 6 is the node's +Z, and 1 to 3 are world axes turned back into the node's frame.
+The snow now blows along its region's yaw at about 8 m/s, and the 6-driven fog banks (839520, 839540, 839541, 839547) drift sideways at 0.3 to 1 m/s instead of rising.
+The torch 300163 and brazier 839530 nodes that motivated the world-up reading still rise through their negative gravity; their 6 nodes are slow (0.075 to 0.4 m/s).
+Open: object dummy orientation (FLVER dummy forward / upward) is not applied to map object effects, only the dummy position; the brazier dummy 200 faces +Z with +Y up, so it does not change these effects.
