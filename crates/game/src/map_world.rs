@@ -164,9 +164,16 @@ pub(crate) struct Block {
     retire_frames: u8,
     detail: BTreeMap<String, [bool; 3]>,
     /// The block's part entities are spawned and its GLBs held ([`residency`]).
-    loaded: bool,
-    /// Seconds left before a loaded block nobody wants is unloaded.
-    unload_in: Option<f32>,
+    residency: Residency,
+}
+
+/// Whether a block's parts and GLBs are in memory ([`residency`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Residency {
+    Unloaded,
+    Loaded,
+    /// Loaded, but nobody has wanted it for a while: unloads when the seconds left run out.
+    Retiring(f32),
 }
 
 /// WorldBackRead's "Hit" set (`docs/MAP-COMPLETENESS.md`, section 3): a block within this
@@ -178,13 +185,12 @@ const KEEP_DISTANCE: f32 = 90.0;
 const RETIRE_SECS: f32 = 3.0;
 
 impl Block {
-    /// Horizontal distance from `point` to the nearest of the block's collision parts.
-    fn distance(&self, point: Vec3) -> f32 {
+    /// Whether `point` is within `reach` (horizontally) of one of the block's collision parts.
+    fn within(&self, point: Vec3, reach: f32) -> bool {
         let p = point.xz();
         self.collisions
             .iter()
-            .map(|s| p.distance(p.clamp(s.min, s.max)))
-            .fold(f32::INFINITY, f32::min)
+            .any(|s| p.distance_squared(p.clamp(s.min, s.max)) <= reach * reach)
     }
 
     fn demanded(&self) -> bool {
@@ -194,19 +200,18 @@ impl Block {
     /// Whether the block's assets should be in memory: it is demanded, or one of `points`
     /// is within the load distance (the keep distance once loaded).
     fn wanted(&self, points: &[Vec3]) -> bool {
-        let reach = if self.loaded {
-            KEEP_DISTANCE
-        } else {
+        let reach = if self.residency == Residency::Unloaded {
             LOAD_DISTANCE
+        } else {
+            KEEP_DISTANCE
         };
-        self.demanded() || points.iter().any(|&p| self.distance(p) <= reach)
+        self.demanded() || points.iter().any(|&p| self.within(p, reach))
     }
 
     /// Forget the block's assets after its parts were despawned, returning the GLB handles
     /// it held so the stream drops them too.
     fn unload(&mut self) -> std::collections::HashSet<bevy::asset::UntypedAssetId> {
-        self.loaded = false;
-        self.unload_in = None;
+        self.residency = Residency::Unloaded;
         self.assets_ready = false;
         self.glb_total = 0;
         self.handles.drain(..).map(|h| h.id().untyped()).collect()
@@ -214,6 +219,11 @@ impl Block {
 }
 
 impl MapWorld {
+    /// Fixed captures and the all-groups debug view keep every block loaded.
+    fn keeps_all(&self, groups: GroupMode) -> bool {
+        self.capture_views.is_some() || groups == GroupMode::Off
+    }
+
     /// Advance each block's residency by `dt` seconds with the focus at `points`: the blocks
     /// to load now, and those nobody wanted for [`RETIRE_SECS`] to unload (only once
     /// `may_unload`). Wanting a retiring block again keeps it.
@@ -226,20 +236,25 @@ impl MapWorld {
         let mut load = BTreeSet::new();
         let mut unload = Vec::new();
         for block in self.blocks.values_mut() {
-            match (block.loaded, block.wanted(points)) {
-                (false, true) => {
+            block.residency = match (block.residency, block.wanted(points)) {
+                (Residency::Unloaded, true) => {
                     load.insert(block.id.clone());
+                    Residency::Unloaded
                 }
-                (true, true) => block.unload_in = None,
-                (true, false) if may_unload => {
-                    let left = block.unload_in.unwrap_or(RETIRE_SECS) - dt;
-                    block.unload_in = Some(left);
+                (Residency::Unloaded, false) => Residency::Unloaded,
+                (_, true) => Residency::Loaded,
+                (state, false) if !may_unload => state,
+                (state, false) => {
+                    let left = match state {
+                        Residency::Retiring(left) => left,
+                        _ => RETIRE_SECS,
+                    } - dt;
                     if left <= 0. {
                         unload.push(block.id.clone());
                     }
+                    Residency::Retiring(left)
                 }
-                _ => {}
-            }
+            };
         }
         (load, unload)
     }
@@ -683,8 +698,7 @@ impl MapWorld {
                     warm_mask: [0; 8],
                     retire_frames: 0,
                     detail,
-                    loaded: false,
-                    unload_in: None,
+                    residency: Residency::Unloaded,
                 },
             );
         }
@@ -952,7 +966,7 @@ pub(crate) fn update(
     }
     for block in world.blocks.values_mut() {
         // Streaming requests a block's GLBs over time; it is ready once every one has loaded.
-        block.assets_ready = block.loaded
+        block.assets_ready = block.residency != Residency::Unloaded
             && (block.assets_ready
                 || (block.handles.len() >= block.glb_total
                     && block
@@ -997,9 +1011,7 @@ pub(crate) fn startup_blocks(world: &MapWorld, scene: &super::MapScene) -> BTree
         .blocks
         .values()
         .filter(|b| {
-            world.capture_views.is_some()
-                || scene.groups == GroupMode::Off
-                || scene.focus.is_none_or(|f| b.distance(f) <= LOAD_DISTANCE)
+            world.keeps_all(scene.groups) || scene.focus.is_none_or(|f| b.within(f, LOAD_DISTANCE))
         })
         .map(|b| b.id.clone())
         .collect()
@@ -1024,7 +1036,7 @@ pub(super) fn residency(
 ) {
     // Fixed captures and the all-groups debug view keep every block; a block never unloads
     // while the first load is still counting its instances.
-    if world.capture_views.is_some() || groups.mode == GroupMode::Off {
+    if world.keeps_all(groups.mode) {
         return;
     }
     let points: Vec<_> = focus.iter().map(|t| t.translation).collect();
@@ -1158,7 +1170,7 @@ pub(crate) fn spawn(
     focus: Option<Vec3>,
 ) {
     for id in blocks {
-        world.blocks.get_mut(id).expect("listed block").loaded = true;
+        world.blocks.get_mut(id).expect("listed block").residency = Residency::Loaded;
     }
     if scene.no_pieces {
         return;
@@ -2744,15 +2756,15 @@ mod tests {
         }
         let mut world = MapWorld::load(&cache, ASHINA[0], "maps/m11_00_00_00/").unwrap();
         for block in world.blocks.values_mut() {
-            block.loaded = true;
+            block.residency = Residency::Loaded;
         }
         // On m11_00's ledge part; nothing is demanded, so distance alone decides.
         let here = Vec3::new(-136.5, -42.54, -118.0);
-        assert_eq!(world.blocks[ASHINA[0]].distance(here), 0.0);
+        assert!(world.blocks[ASHINA[0]].within(here, 0.0));
         let far: Vec<_> = world
             .blocks
             .values()
-            .filter(|b| b.distance(here) > KEEP_DISTANCE)
+            .filter(|b| !b.within(here, KEEP_DISTANCE))
             .map(|b| b.id.clone())
             .collect();
         assert!(!far.is_empty(), "every block is near the ledge");

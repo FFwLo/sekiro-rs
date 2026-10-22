@@ -102,16 +102,14 @@ impl StaticBatches {
 }
 
 pub(super) fn install(app: &mut App) {
-    app.init_resource::<StaticBatches>()
-        .add_message::<crate::map::world::BlockUnloaded>()
-        .add_systems(
-            PostUpdate,
-            (changed_batches, update.run_if(has_work))
-                .chain()
-                .after(bevy::transform::TransformSystems::Propagate)
-                .after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
-                .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
-        );
+    app.init_resource::<StaticBatches>().add_systems(
+        PostUpdate,
+        (changed_batches, update.run_if(has_work))
+            .chain()
+            .after(bevy::transform::TransformSystems::Propagate)
+            .after(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
+            .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
+    );
 }
 
 #[allow(clippy::type_complexity)] // Independent source-state change filters.

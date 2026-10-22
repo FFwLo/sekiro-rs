@@ -141,7 +141,6 @@ pub(crate) fn install(app: &mut App, dir: &Path, prefix: &str) -> Result<()> {
         });
     }
     app.insert_resource(grass)
-        .add_message::<crate::map::world::BlockUnloaded>()
         .add_systems(PreUpdate, (release, instantiate).chain())
         .add_systems(PostUpdate, enforce_shadow_flags);
     Ok(())

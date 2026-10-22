@@ -767,7 +767,6 @@ pub fn add_map(
         stage("connected world and story");
         app.add_plugins(visibility::MapVisibilityPlugin)
             .insert_resource(world)
-            .add_message::<world::BlockUnloaded>()
             .add_systems(
                 Update,
                 (world::update, world::residency, world::update_detail)
@@ -943,6 +942,8 @@ pub fn add_map(
         ));
         crate::perf_log::install_render_probe(app);
     }
+    // Read by the grass and static batches, written by connected worlds.
+    app.add_message::<world::BlockUnloaded>();
     map_material::install(app, &scene.prefix, dir, &args);
     crate::vram::install(app);
     crate::map_fog_surface::install(app, &scene.prefix);
