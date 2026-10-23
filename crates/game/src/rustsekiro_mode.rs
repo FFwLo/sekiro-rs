@@ -165,6 +165,11 @@ impl rustsekiro::WorldCollision for World {
     fn enemy_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
         sekiro_sim::body::Ground::floor(&self.2, x, z, top)
     }
+    /// The `h` ground kept around Wolf ([`Self::foot_floor`] moves it; an enemy's feet do not),
+    /// else the enemy floor.
+    fn enemy_foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        self.3.as_ref().and_then(|g| g.height(x, z, top)).or_else(|| self.enemy_floor(x, z, top))
+    }
     fn enemy_slide(&self, feet: [f32; 3], delta: [f32; 2]) -> [f32; 2] {
         sekiro_sim::body::Ground::slide(&self.2, feet, delta)
     }
