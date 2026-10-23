@@ -314,12 +314,13 @@ fn after(app: &mut App) {
         let nav = rustsekiro::navmesh::load(&cache, &layouts);
         info!("rustsekiro: navmesh, {} polygons, {:.1} s", nav.polygon_count(), t1.elapsed().as_secs_f32());
         rustsekiro::navmesh::install(Some(nav));
-        Ok((world, feet, blocks, warp))
+        Ok((world, feet, blocks, warp, sound_spaces(&layouts)))
     })();
     // Wolf's start: the idol's warp point, else the camera's spot (its floor below).
-    let (mut at, mut warp, mut collision) = (None, None, None);
+    let (mut at, mut warp, mut collision, mut spaces) = (None, None, None, SoundSpaces::default());
     match world {
-        Ok((w, feet, blocks, i)) => {
+        Ok((w, feet, blocks, i, s)) => {
+            spaces = s;
             edges(app, &blocks);
             info!("rustsekiro: play-world collision, {} triangles, {:.1} s", w.triangle_count(), t0.elapsed().as_secs_f32());
             if let Start::Camera([x, y, z, _]) = start {
@@ -355,10 +356,12 @@ fn after(app: &mut App) {
     let offset = Vec3::new(x, floor, z) - rot * Vec3::new(0.0, 0.0, 4.0);
     rustsekiro::set_frame(rustsekiro::Frame { rot, yaw, offset });
     app.add_plugins((rustsekiro::CombatCorePlugin, rustsekiro::CameraPlugin, rustsekiro::HudPlugin, rustsekiro::MenuPlugins, rustsekiro::DebugMenuPlugin, rustsekiro::SoundPlugins))
-        // The combat's sound: the map's area music and indoor regions (sekiro-rs's absolute space).
+        // The combat's sound: the map's area music and indoor regions (sekiro-rs's absolute space),
+        // then those of the block Wolf stands in (`follow_sound_place`).
         .insert_resource(rustsekiro::SoundPlace { source_map: map.clone(), sound_space: 0, space: rustsekiro::MapSpace::Absolute })
+        .insert_resource(spaces)
         .init_resource::<crate::map_fx::FoundIdols>()
-        .add_systems(Update, (mark_camera, light_idols, scene_light));
+        .add_systems(Update, (mark_camera, light_idols, scene_light, follow_sound_place));
     wire(app, &cache, &map, collision);
 }
 
@@ -430,8 +433,10 @@ fn search_wire(
     wolf: Query<(&Transform, &rustsekiro::Player)>,
     camera: Query<&GlobalTransform, With<rustsekiro::HostCamera>>,
     lock: Option<Res<rustsekiro::LockOn>>,
+    foes: Option<Res<rustsekiro::EnemyGrapples>>,
     mut aim: ResMut<rustsekiro::WireAim>,
     mut preview: ResMut<crate::play::grapple_hud::Preview>,
+    mut last_foe: Local<Option<Entity>>,
 ) {
     let Some(mut his) = his else { return };
     let (Ok((tf, player)), Ok(eye)) = (wolf.single(), camera.single()) else { return };
@@ -467,6 +472,25 @@ fn search_wire(
         }
     });
     preview.0 = his.wire.preview.clone();
+    // The enemies and objects open to the wire (Gyoubu's helmet, the Ogre, the Ape's sword, the
+    // Divine Dragon's trees) are the combat's own: its search ranks them against his hook, and a
+    // winning one takes the aim and the marker (its state from his search's distances).
+    let foes = foes.as_ref().map_or(&[][..], |f| &f.0[..]);
+    *last_foe = rustsekiro::host_aim_foes(&mut *aim, foes, eye.translation(), *f, centre, *last_foe);
+    if let (Some(_), Some(t)) = (*last_foe, aim.target) {
+        let state = if t.in_action_range {
+            MarkerState::Ready
+        } else {
+            his.wire.search.as_ref().map_or(MarkerState::Hidden, |s| s.marker_state(t.dist, 0.0))
+        };
+        preview.0 = (state != MarkerState::Hidden).then(|| sekiro_sim::wire::Target {
+            state,
+            index: usize::MAX,
+            point: t.point.hook.to_array().into(),
+            arrival: t.point.land.to_array().into(),
+            rideable: t.ride,
+        });
+    }
 }
 
 /// The idols Wolf has knelt at (RustSekiro's idol menu, `IdolHooks::rested`), by entity; the
@@ -476,6 +500,58 @@ static RESTED: std::sync::Mutex<std::collections::BTreeSet<i32>> = std::sync::Mu
 fn rested(entity: i64) {
     if let Ok(mut r) = RESTED.lock() {
         r.insert(entity as i32);
+    }
+}
+
+/// Each play-world collision part's reverb, MSB `SoundSpaceType` (layout `collision.
+/// sound_space_type`), by (block, part name).
+#[derive(Resource, Default)]
+struct SoundSpaces(std::collections::HashMap<(String, String), u8>);
+
+fn sound_spaces(layouts: &std::collections::BTreeMap<String, serde_json::Value>) -> SoundSpaces {
+    let mut spaces = std::collections::HashMap::new();
+    for (block, layout) in layouts {
+        for row in layout["parts"].as_array().into_iter().flatten().filter(|r| r["kind"] == "Collision") {
+            if let (Some(name), Some(space)) = (row["name"].as_str(), row["collision"]["sound_space_type"].as_u64()) {
+                // Bounded to 8 as RustSekiro's map.rs bounds its arena's.
+                spaces.insert((block.clone(), name.to_string()), space.min(8) as u8);
+            }
+        }
+    }
+    SoundSpaces(spaces)
+}
+
+/// The sound place of the collision part Wolf stands on (`MapWorld::selected`, the part his
+/// feet select the map from): its block's area music and indoor regions (area_bgm.json is per
+/// block, each its own tracks and flag 9100 regions) and the part's reverb. Returns whether it
+/// changed.
+fn place_on(place: &mut rustsekiro::SoundPlace, (block, part): &(String, String), spaces: &SoundSpaces) -> bool {
+    let space = spaces.0.get(&(block.clone(), part.clone())).copied().unwrap_or(0);
+    if place.source_map == *block && place.sound_space == space {
+        return false;
+    }
+    if place.source_map != *block {
+        place.source_map = block.clone();
+    }
+    place.sound_space = space;
+    true
+}
+
+/// The connected world spans several blocks: the sound place follows the part Wolf stands on,
+/// not the `--map` block it started in.
+fn follow_sound_place(
+    world: Option<Res<crate::map::world::MapWorld>>,
+    spaces: Res<SoundSpaces>,
+    mut place: ResMut<rustsekiro::SoundPlace>,
+    mut last: Local<Option<(String, String)>>,
+) {
+    let Some(selected) = world.as_ref().and_then(|w| w.selected.as_ref()) else { return };
+    if last.as_ref() == Some(selected) {
+        return;
+    }
+    *last = Some(selected.clone());
+    if place_on(&mut place, selected, &spaces) {
+        info!("rustsekiro: sound place {} ({}), reverb {}", place.source_map, selected.1, place.sound_space);
     }
 }
 
@@ -561,6 +637,36 @@ fn edges(app: &mut App, blocks: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sound place follows the block and part Wolf stands on: a step from the castle into
+    /// the outskirts takes the outskirts' area music and indoor regions and that part's reverb.
+    #[test]
+    fn sound_place_follows_the_standing_block() {
+        let layouts = std::collections::BTreeMap::from([
+            (
+                "m11_01_00_00".to_string(),
+                serde_json::json!({"parts": [{"kind": "Collision", "name": "h000100", "collision": {"sound_space_type": 2}}]}),
+            ),
+            (
+                "m11_00_00_00".to_string(),
+                serde_json::json!({"parts": [
+                    {"kind": "Collision", "name": "h000200", "collision": {"sound_space_type": 3}},
+                    {"kind": "MapPiece", "name": "m000200", "collision": {"sound_space_type": 7}},
+                ]}),
+            ),
+        ]);
+        let spaces = sound_spaces(&layouts);
+        assert_eq!(spaces.0.len(), 2, "only collision parts carry a reverb");
+        let mut place = rustsekiro::SoundPlace { source_map: "m11_01_00_00".into(), sound_space: 0, space: rustsekiro::MapSpace::Absolute };
+        assert!(place_on(&mut place, &("m11_01_00_00".into(), "h000100".into()), &spaces));
+        assert_eq!((place.source_map.as_str(), place.sound_space), ("m11_01_00_00", 2));
+        assert!(place_on(&mut place, &("m11_00_00_00".into(), "h000200".into()), &spaces));
+        assert_eq!((place.source_map.as_str(), place.sound_space), ("m11_00_00_00", 3));
+        assert!(!place_on(&mut place, &("m11_00_00_00".into(), "h000200".into()), &spaces), "same part, no change");
+        // A part with no row keeps its block and the plain reverb.
+        assert!(place_on(&mut place, &("m11_00_00_00".into(), "h999999".into()), &spaces));
+        assert_eq!((place.source_map.as_str(), place.sound_space), ("m11_00_00_00", 0));
+    }
 
     /// A Travel keeps the run's cache and options and replaces only its start.
     #[test]
