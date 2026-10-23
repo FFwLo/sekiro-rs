@@ -5539,7 +5539,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sv1"
 version = "0.2.1"
-source = "git+https://github.com/FFwLo/RustSekiro?branch=main#c01232725bccb7ba6eba4fd5006ac5a937ae0776"
+source = "git+https://github.com/FFwLo/RustSekiro?branch=main#3151a6507925a0e4f684b38875ab7d52a4dcab22"
 dependencies = [
  "bevy",
  "libloading",
