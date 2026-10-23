@@ -1067,8 +1067,17 @@ pub fn run(options: Options) -> Result<()> {
     if let Some((before, _)) = APP_HOOKS.get() {
         before(&mut app);
     }
+    #[cfg(feature = "profile-spans")]
+    let defaults = DefaultPlugins.set(bevy::log::LogPlugin {
+        custom_layer: crate::span_profile::layer,
+        ..default()
+    });
+    #[cfg(not(feature = "profile-spans"))]
+    let defaults = DefaultPlugins;
+    #[cfg(feature = "profile-spans")]
+    app.add_systems(Last, crate::span_profile::report);
     app.add_plugins((
-        DefaultPlugins
+        defaults
             .set(crate::vram::render_plugin())
             .set(layered_gltf_plugin())
             .set(WindowPlugin {
