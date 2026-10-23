@@ -338,8 +338,32 @@ fn after(app: &mut App) {
         // The combat's sound: the map's area music and indoor regions (sekiro-rs's absolute space).
         .insert_resource(rustsekiro::SoundPlace { source_map: map.clone(), sound_space: 0, space: rustsekiro::MapSpace::Absolute })
         .init_resource::<crate::map_fx::FoundIdols>()
-        .add_systems(Update, (mark_camera, light_idols));
+        .add_systems(Update, (mark_camera, light_idols, scene_light));
     wire(app, &cache, &map, collision);
+}
+
+/// The map's light set in force as the combat's particle light (`rustsekiro::SceneLight`): its
+/// lit hit effects (blood mist, dust, smoke) take the map's ambient and sun at this hour, not
+/// the plain midday they fall back to.
+fn scene_light(mut commands: Commands, lighting: Option<Res<crate::lighting::MapLighting>>, now: Option<Res<rustsekiro::SceneLight>>, mut key: Local<Option<(i32, u32)>>) {
+    let Some(l) = lighting else { return };
+    let k = (l.light_set, l.hour.to_bits());
+    if *key == Some(k) && now.is_some() {
+        return;
+    }
+    *key = Some(k);
+    let set = crate::lighting::LightSet::from_gparam(&l.gparam, l.light_set, l.hour);
+    let lin = |c: Color| {
+        let c = c.to_linear();
+        Vec3::new(c.red, c.green, c.blue)
+    };
+    let env = crate::lighting::ENV_PER_UNIT;
+    commands.insert_resource(rustsekiro::SceneLight {
+        ambient: lin(set.ambient) * env,
+        sun: lin(set.sun_color) * set.sun_lux / crate::lighting::SCENE_TO_BEVY * env,
+        to_sun: set.sun_toward,
+        lumens_per_unit: crate::lighting::LOCAL_LUMENS_PER_UNIT,
+    });
 }
 
 /// sekiro-rs's grapple for the combat's Wolf: its hook search (`sekiro_sim::wire::Wire::search`,
