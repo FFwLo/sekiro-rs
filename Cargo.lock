@@ -5279,6 +5279,7 @@ dependencies = [
  "anyhow",
  "bevy",
  "bevy_ecs",
+ "memmap2",
  "sekiro-brain-net",
  "sekiro-fmod",
  "sekiro-formats",
