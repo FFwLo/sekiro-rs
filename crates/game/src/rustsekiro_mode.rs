@@ -173,6 +173,9 @@ impl rustsekiro::WorldCollision for World {
     fn enemy_slide(&self, feet: [f32; 3], delta: [f32; 2]) -> [f32; 2] {
         sekiro_sim::body::Ground::slide(&self.2, feet, delta)
     }
+    fn enemy_slide_sized(&self, feet: [f32; 3], delta: [f32; 2], radius: f32, height: f32) -> [f32; 2] {
+        self.2.slide_sized(feet, delta, sekiro_sim::collision::BodySize::new(radius, height))
+    }
     fn slide(&self, feet: [f32; 3], delta: [f32; 2]) -> [f32; 2] {
         self.0.slide(feet, delta)
     }

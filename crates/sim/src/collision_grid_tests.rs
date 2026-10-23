@@ -237,8 +237,16 @@ fn banded_grid_reads_what_a_brute_force_scan_keeps() {
             ]);
             let cull = i % 8 != 0;
             let (mut body, mut walls) = (Vec::new(), Vec::new());
-            world.gather_slide(feet, d, [who, assist], &mut body, &mut walls, cull);
-            let reach = SlideReach::new(feet, d, cull);
+            world.gather_slide(
+                feet,
+                d,
+                [who, assist],
+                &mut body,
+                &mut walls,
+                cull,
+                BodySize::WOLF,
+            );
+            let reach = SlideReach::new(feet, d, cull, BodySize::WOLF);
             let near = cells.between(reach.min, reach.max);
             let keep = |f: &dyn Fn(u32) -> bool| -> Vec<u32> {
                 near.iter().copied().filter(|&t| f(t)).collect()
