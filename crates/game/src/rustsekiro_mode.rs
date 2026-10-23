@@ -210,7 +210,7 @@ impl rustsekiro::WorldCollision for World {
             if on {
                 *last = Some(now);
             }
-            last.is_some_and(|t| now.duration_since(t).as_secs_f32() <= hf::SP_EFFECT_4100_ENDURANCE)
+            last.is_some_and(|t| now.duration_since(t).as_secs_f32() <= RIDING_ENDURANCE)
         };
         sekiro_sim::body::Ground::slide_assisted(&self.0, feet, delta, hf::riding_walls(walls, riding))
     }
@@ -218,6 +218,11 @@ impl rustsekiro::WorldCollision for World {
         self.0.trigger_contact(from, to).is_some_and(|c| c.hit_filter == sekiro_sim::hit_filter::FALL_RETURN_FILTER)
     }
 }
+
+/// SpEffectParam 4100's ([`hf::RIDING_SP_EFFECT`]) effectEndurance, 0.06 s: the sim reads it
+/// per character from the params ([`sekiro_sim::tae::TaeDb::floor_effect`]); this slide has
+/// no character's tables.
+const RIDING_ENDURANCE: f32 = 0.06;
 
 /// Before `DefaultPlugins`: the combat's texture source.
 fn before(app: &mut App) {
