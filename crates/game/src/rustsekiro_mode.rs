@@ -136,16 +136,36 @@ fn travel(entity: i64) {
     let map = format!("m{:02}_{:02}_00_00", entity / 100_000, (entity / 10_000) % 10);
     let dir = DIR.get().cloned().unwrap_or_default();
     info!("rustsekiro: travel to idol {entity} on {map}");
+    let args = travel_args(&std::env::args().collect::<Vec<_>>(), &map, entity, &dir);
     let started = std::env::current_exe().and_then(|exe| {
         std::process::Command::new(exe)
-            .args(["--map", &map, "--at-idol", &entity.to_string(), "--rustsekiro"])
-            .arg(&dir)
+            .args(args)
+            // The run's cache folder, also when it came from --cache (root() is absolute).
+            .env("SEKIRO_CACHE", sekiro_sim::cache::root())
             .spawn()
     });
     match started {
         Ok(_) => std::process::exit(0),
         Err(e) => error!("rustsekiro: travel to {map}: {e}"),
     }
+}
+
+/// The new run's command line: this run's own (`--cache`, `--hour`, `--present-mode`,
+/// `--uncapped` as given) without its start (`--map`, `--at-idol`, `--camera`, `--rustsekiro` and
+/// their values), then the idol's map and entity and the RustSekiro folder.
+fn travel_args(parent: &[String], map: &str, entity: i64, dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = parent.iter().skip(1);
+    while let Some(a) = rest.next() {
+        if matches!(a.as_str(), "--map" | "--at-idol" | "--camera" | "--rustsekiro") {
+            rest.next();
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out.extend(["--map".into(), map.into(), "--at-idol".into(), entity.to_string(), "--rustsekiro".into()]);
+    out.push(dir.to_string_lossy().into_owned());
+    out
 }
 
 fn open_world() -> bool {
@@ -536,4 +556,27 @@ fn edges(app: &mut App, blocks: &[String]) {
     }
     info!("rustsekiro: {} wire points, {} hang / hug edges", grapple.len(), ledges.len());
     app.insert_resource(GrapplePoints(grapple)).insert_resource(LedgeEdges(ledges));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Travel keeps the run's cache and options and replaces only its start.
+    #[test]
+    fn travel_args_keep_the_cache_and_options() {
+        let parent: Vec<String> = [
+            "exe", "--cache", "D:/c", "--map", "m11_01_00_00", "--at-idol", "1111950", "--hour", "12", "--uncapped", "--camera", "1,2,3,4,5", "--rustsekiro", "R",
+        ]
+        .map(String::from)
+        .to_vec();
+        let args = travel_args(&parent, "m11_00_00_00", 1101950, std::path::Path::new("R"));
+        let count = |a: &str| args.iter().filter(|x| *x == a).count();
+        assert_eq!((count("--map"), count("--at-idol"), count("--rustsekiro"), count("--camera")), (1, 1, 1, 0), "{args:?}");
+        assert_eq!(crate::arg_value(&args, "--map").as_deref(), Some("m11_00_00_00"));
+        assert_eq!(crate::arg_value(&args, "--at-idol").as_deref(), Some("1101950"));
+        assert_eq!(crate::arg_value(&args, "--cache").as_deref(), Some("D:/c"));
+        assert_eq!(crate::arg_value(&args, "--hour").as_deref(), Some("12"));
+        assert!(args.iter().any(|a| a == "--uncapped"), "{args:?}");
+    }
 }

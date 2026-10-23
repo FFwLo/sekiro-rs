@@ -5539,7 +5539,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sv1"
 version = "0.2.1"
-source = "git+https://github.com/FFwLo/RustSekiro?branch=sekiro-rs-host#5c0d14afd8ae932c1ba1de5c2660b5168777b75d"
+source = "git+https://github.com/FFwLo/RustSekiro?branch=sekiro-rs-host#843fd7b6b2934a4760b6add9edecc5802c3297ea"
 dependencies = [
  "bevy",
  "libloading",
