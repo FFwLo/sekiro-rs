@@ -125,13 +125,14 @@ fn blocks() -> Vec<String> {
 /// the material with the deep-water rule, the camera's own collision, the ceilings. The second
 /// field is when Wolf last stood on a rideable floor (the riding state, SpEffect 4100); the
 /// third the same world as the enemies see it (play.rs gives them `EnemyGround`: enemy-only
-/// walls and floors, hit filters 11, 16 and 19).
-struct World(Arc<sekiro_sim::collision::CollisionWorld>, std::sync::Mutex<Option<std::time::Instant>>, sekiro_sim::collision::EnemyGround);
+/// walls and floors, hit filters 11, 16 and 19); the fourth the detailed `h` collision the feet
+/// are cast on where the body stands on an `l` mesh (map_world.rs `foot_world`).
+struct World(Arc<sekiro_sim::collision::CollisionWorld>, std::sync::Mutex<Option<std::time::Instant>>, sekiro_sim::collision::EnemyGround, Option<sekiro_sim::collision::CollisionWorld>);
 
 impl World {
-    fn new(world: sekiro_sim::collision::CollisionWorld) -> Self {
+    fn new(world: sekiro_sim::collision::CollisionWorld, feet: Option<sekiro_sim::collision::CollisionWorld>) -> Self {
         let world = Arc::new(world);
-        Self(world.clone(), std::sync::Mutex::new(None), sekiro_sim::collision::EnemyGround(world))
+        Self(world.clone(), std::sync::Mutex::new(None), sekiro_sim::collision::EnemyGround(world), feet)
     }
 }
 
@@ -153,6 +154,12 @@ impl rustsekiro::WorldCollision for World {
     }
     fn ceiling(&self, feet: [f32; 3], rise: f32) -> Option<f32> {
         sekiro_sim::body::Ground::ceiling(&self.0, feet, rise)
+    }
+    fn foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        match &self.3 {
+            Some(h) => h.floor(x, z, top),
+            None => sekiro_sim::body::Ground::floor(&self.0, x, z, top),
+        }
     }
     fn enemy_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
         sekiro_sim::body::Ground::floor(&self.2, x, z, top)
@@ -219,6 +226,7 @@ fn after(app: &mut App) {
         let stories = crate::map::story::load_blocks(&cache, &layouts)?;
         let blocks: Vec<String> = layouts.keys().cloned().collect();
         let world = crate::map::world::collision_world(&cache, &layouts, &stories)?;
+        let feet = crate::map::world::foot_world(&cache, &layouts)?;
         // An idol's warp point: the player part `entity - 980` (play/idol.rs WARP_POINT).
         let warp = match start {
             Start::Idol(e) => layouts
@@ -236,19 +244,19 @@ fn after(app: &mut App) {
         let nav = rustsekiro::navmesh::load(&cache, &layouts);
         info!("rustsekiro: navmesh, {} polygons, {:.1} s", nav.polygon_count(), t1.elapsed().as_secs_f32());
         rustsekiro::navmesh::install(Some(nav));
-        Ok((world, blocks, warp))
+        Ok((world, feet, blocks, warp))
     })();
     // Wolf's start: the idol's warp point, else the camera's spot (its floor below).
     let (mut at, mut warp, mut collision) = (None, None, None);
     match world {
-        Ok((w, blocks, i)) => {
+        Ok((w, feet, blocks, i)) => {
             edges(app, &blocks);
             info!("rustsekiro: play-world collision, {} triangles, {:.1} s", w.triangle_count(), t0.elapsed().as_secs_f32());
             if let Start::Camera([x, y, z, _]) = start {
                 at = w.floor_hit(x, z, y).map(|(h, _)| Vec3::new(x, h, z));
             }
             warp = i;
-            let w = World::new(w);
+            let w = World::new(w, feet);
             collision = Some(w.0.clone());
             rustsekiro::Terrain::from_world(Arc::new(w)).install();
         }

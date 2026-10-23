@@ -500,6 +500,28 @@ pub(crate) fn play_blocks(cache: &Path, id: &str) -> Result<BTreeMap<String, Val
     }
 }
 
+/// The detailed `h` collision (`collision.bin`) of the blocks whose characters stand on an `l`
+/// mesh, for RustSekiro's foot IK: the game casts the feet on `h` (docs/HIT-FILTERS.md), so on the
+/// Stairway idol platform, whose `l` is a flat slab 0.2 m over the drawn craters, they still meet
+/// the ground (#276). `None` when no block has an `l` mesh: the play collision is `h` already.
+pub(crate) fn foot_world(
+    cache: &Path,
+    layouts: &BTreeMap<String, Value>,
+) -> Result<Option<sekiro_sim::collision::CollisionWorld>> {
+    let dirs: Vec<_> = layouts.keys().map(|b| cache.join("maps").join(b)).collect();
+    if !dirs.iter().any(|d| d.join(sekiro_sim::lo_collision::LOW_FILE).is_file()) {
+        return Ok(None);
+    }
+    let mut mesh = CollisionMesh::default();
+    for dir in dirs {
+        let path = dir.join(sekiro_sim::lo_collision::HIGH_FILE);
+        if let Ok(bytes) = std::fs::read(&path) {
+            mesh.extend(&CollisionMesh::from_bytes(&bytes).with_context(|| path.display().to_string())?);
+        }
+    }
+    Ok(Some(sekiro_sim::collision::CollisionWorld::from_mesh(&mesh)))
+}
+
 /// Physics bootstrap uses the same bounded block inventory as rendering ([`play_blocks`]).
 /// Collision/group records remain separate in MapWorld; only the broad-phase query
 /// mesh is concatenated, without adding MapOffset or translating any vertex.
