@@ -120,6 +120,8 @@ fn dispatch() -> anyhow::Result<()> {
     {
         return map::sweep::run(&args);
     }
+    // This fork plays RustSekiro's Wolf only (rustsekiro_mode.rs).
+    let args = rustsekiro_mode::own_wolf_args(args)?;
     if args.len() == 1 || args.iter().any(|a| a == "--menu") {
         return menu::run(&args);
     }

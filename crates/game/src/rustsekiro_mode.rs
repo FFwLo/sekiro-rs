@@ -7,6 +7,9 @@
 //! on the floor under the camera, facing its yaw, with the config's enemy 8 m ahead; or at an
 //! idol's warp point (BonfireWarpParam `bonfireEntityId`, e.g. 1101956 Ashina Outskirts on
 //! m11_00_00_00) in the open world, with the map's own enemies around him.
+//!
+//! This fork has no other Wolf: [`own_wolf_args`] starts every map in this mode, with no
+//! arguments at the Ashina Castle idol, and refuses sekiro-rs's own play modes.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -29,6 +32,39 @@ static BLOCKS: OnceLock<Vec<String>> = OnceLock::new();
 static IDOLS: OnceLock<std::collections::HashMap<i64, (Vec3, Vec3)>> = OnceLock::new();
 /// The command line's RustSekiro folder (a Travel to another map starts this exe again).
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where this fork starts with no arguments: the Ashina Castle idol.
+const DEFAULT_START: [&str; 4] = ["--map", "m11_01_00_00", "--at-idol", "1111950"];
+
+/// This fork plays RustSekiro's Wolf only. Fills in `--rustsekiro <dir>` for a map
+/// ([`default_dir`]) and [`DEFAULT_START`] when there are no arguments; refuses the modes that
+/// play sekiro-rs's own Wolf (`--play`, `--arena`, the start menu).
+pub fn own_wolf_args(mut args: Vec<String>) -> Result<Vec<String>> {
+    if args.len() == 1 {
+        args.extend(DEFAULT_START.map(String::from));
+    }
+    anyhow::ensure!(
+        !args.iter().any(|a| matches!(a.as_str(), "--play" | "--arena" | "--menu")),
+        "this build plays RustSekiro's Wolf only: start it with --map <id> --at-idol <entity> (or no arguments), not --play, --arena or --menu"
+    );
+    if crate::arg_value(&args, "--map").is_some() && crate::arg_value(&args, "--rustsekiro").is_none() {
+        let dir = default_dir().ok_or_else(|| anyhow!("no RustSekiro folder found: pass --rustsekiro <dir> or set RUSTSEKIRO_DIR"))?;
+        args.extend(["--rustsekiro".into(), dir.to_string_lossy().into_owned()]);
+    }
+    Ok(args)
+}
+
+/// The RustSekiro folder when the command line names none: `RUSTSEKIRO_DIR`, else a checkout
+/// next to this one (`../fireguy-rustsekiro`, `../RustSekiro`) that has its `extracted/`.
+fn default_dir() -> Option<PathBuf> {
+    std::env::var_os("RUSTSEKIRO_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(["../fireguy-rustsekiro", "../RustSekiro"].map(PathBuf::from))
+        .find(|d| d.join("extracted").is_dir())
+        // Absolute: the asset server reads RustSekiro's HUD art from the exe's folder otherwise.
+        .and_then(|d| std::path::absolute(d).ok())
+}
 
 /// Sets the map mode up to run the combat (`map::APP_HOOKS`).
 pub fn install(args: &[String], dir: PathBuf) -> Result<()> {
