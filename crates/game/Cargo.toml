@@ -19,7 +19,7 @@ sekiro-brain-net.workspace = true
 sekiro-fmod.workspace = true
 serde_json.workspace = true
 # RustSekiro's combat core with its camera and debug menu (`--rustsekiro`, src/rustsekiro_mode.rs).
-rustsekiro = { package = "sv1", git = "https://github.com/FFwLo/RustSekiro", branch = "main", default-features = false, features = ["embed"] }
+rustsekiro = { package = "sv1", git = "https://github.com/FFwLo/RustSekiro", branch = "sekiro-rs-host", default-features = false, features = ["embed"] }
 memmap2.workspace = true
 wgpu = { version = "30", default-features = false }
 tracing = { version = "0.1", optional = true }
