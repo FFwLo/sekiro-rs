@@ -4,8 +4,8 @@
 //! Rest to the Loop, and from End to standing, by itself.
 //!
 //! The action button at an idol's kneeling spot kneels Wolf there (unless a map item is nearer,
-//! `super::pickup`); while he is at it his own
-//! input is held. Kneeling refills Vitality and makes the idol the checkpoint: the next respawn
+//! `super::pickup`); while he is at it his own input is held, until he stands up (#277).
+//! Kneeling refills Vitality and makes the idol the checkpoint: the next respawn
 //! puts Wolf at its warp point ([`IdolSpot::checkpoint`]). Rest refills him again, refills the
 //! Healing Gourd and restocks the carried goods from the Storage (`Kit::restock`, #186; a
 //! respawn after death does too) and brings the map's foes back on the next step.
@@ -24,8 +24,11 @@
 //! ([`LIGHTING_SECS`]); only then does he pray and the idol menu open. Kneeling at a lit idol
 //! goes straight to the prayer. The idol is lit only once the behaviour takes the kneel
 //! (#262): a press it drops leaves the idol unlit for its first real kneel.
-//! gap: c0000's graph drops W_StatueAttachStart from walk starts and quick turns
-//! (StandMoveStart, StandQuickTurnMoveStart*), so a press while walking up does nothing.
+//! The kneel is the global wildcard of c0000's `Statue_SM`, taken from any state; Wolf's input
+//! is held only from the step after the press (#266), so a walk or quick turn does not read a
+//! let-go stick and stop him over it, and a press while walking up kneels at once.
+//! gap: the exe's order of the engine's kneel event against the HKS's own events of that frame
+//! is not traced; a step or attack pressed in the same frame still wins here.
 //!
 //! Travel (#148): from the prayer, [`Duel::travel_to_idol`] plays the warp state
 //! (StatueAttachWarp a000_710360) and [`WARP_CUT`] into it Wolf leaves. To an idol of this
@@ -262,6 +265,16 @@ impl Duel {
                 self.leave_for(to);
             }
         }
+        // The press step keeps his own input (#266): held at once, a walk's or a quick turn's
+        // update in c0000.hks reads no stick and sends its stop (W_StandRunStop) after the
+        // queued W_StatueAttachStart, which takes him back out of the kneel. The hold starts
+        // the step after, once the kneel is under way. It ends as he stands up (#277): the
+        // stand-up's TAE (a000_710330) buffers presses from 0.4 s and opens every cancel window
+        // at 0.8 s, before its clip ends at 1.33 s, and c0000.hks takes the moves from there.
+        let held = self
+            .idols
+            .at
+            .filter(|_| self.idol_phase() != Some(IdolPhase::Leaving));
         if pressed {
             match self.action_target() {
                 Some(ActionTarget::Idol(i)) => self.kneel_at(i),
@@ -269,7 +282,7 @@ impl Duel {
                 None => {}
             }
         }
-        self.idols.at.map(|_| InputFrame {
+        held.map(|_| InputFrame {
             camera_yaw: input.camera_yaw,
             ..InputFrame::default()
         })

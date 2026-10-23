@@ -500,26 +500,58 @@ pub(crate) fn play_blocks(cache: &Path, id: &str) -> Result<BTreeMap<String, Val
     }
 }
 
-/// The detailed `h` collision (`collision.bin`) of the blocks whose characters stand on an `l`
-/// mesh, for RustSekiro's foot IK: the game casts the feet on `h` (docs/HIT-FILTERS.md), so on the
-/// Stairway idol platform, whose `l` is a flat slab 0.2 m over the drawn craters, they still meet
-/// the ground (#276). `None` when no block has an `l` mesh: the play collision is `h` already.
-pub(crate) fn foot_world(
+/// The parts of each of `layouts`' blocks that `story` switches off, to build the foot IK
+/// ground ([`foot_ik_ground`]) away from the story.
+pub(crate) fn story_off_parts(
+    layouts: &BTreeMap<String, Value>,
+    story: &super::story::MapStory,
+) -> BTreeMap<String, BTreeSet<String>> {
+    layouts
+        .iter()
+        .map(|(block, layout)| {
+            let story = story.maps.get(block);
+            let off = layout["collisions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["name"].as_str())
+                .filter(|n| story.is_some_and(|s| s.switched_off(n)))
+                .map(str::to_string)
+                .collect();
+            (block.clone(), off)
+        })
+        .collect()
+}
+
+/// The ground Wolf's feet meet (#276): each block's high-resolution `h` collision
+/// (`collision.bin`), which foot IK rays meet in the exe while the capsule meets `l`
+/// (`docs/HIT-FILTERS.md`), without the parts `off` names and the helper parts the player does
+/// not collide with, and only its floors ([`crate::foot_ik::Floors::add`]).
+pub(crate) fn foot_ik_ground(
     cache: &Path,
     layouts: &BTreeMap<String, Value>,
-) -> Result<Option<sekiro_sim::collision::CollisionWorld>> {
-    let dirs: Vec<_> = layouts.keys().map(|b| cache.join("maps").join(b)).collect();
-    if !dirs.iter().any(|d| d.join(sekiro_sim::lo_collision::LOW_FILE).is_file()) {
-        return Ok(None);
+    off: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<crate::foot_ik::Floors> {
+    let mut floors = crate::foot_ik::Floors::default();
+    for (block, layout) in layouts {
+        let path = cache
+            .join("maps")
+            .join(block)
+            .join(sekiro_sim::lo_collision::HIGH_FILE);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut mesh = CollisionMesh::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        drop(bytes);
+        let off = off.get(block);
+        sekiro_sim::arenas_a::remove_hidden_collision(&mut mesh, layout, |n| {
+            off.is_some_and(|o| o.contains(n))
+        });
+        sekiro_sim::hit_filter::strip_helpers(&mut mesh, layout);
+        floors.add(&mesh);
     }
-    let mut mesh = CollisionMesh::default();
-    for dir in dirs {
-        let path = dir.join(sekiro_sim::lo_collision::HIGH_FILE);
-        if let Ok(bytes) = std::fs::read(&path) {
-            mesh.extend(&CollisionMesh::from_bytes(&bytes).with_context(|| path.display().to_string())?);
-        }
-    }
-    Ok(Some(sekiro_sim::collision::CollisionWorld::from_mesh(&mesh)))
+    Ok(floors)
 }
 
 /// Physics bootstrap uses the same bounded block inventory as rendering ([`play_blocks`]).
@@ -2844,5 +2876,82 @@ mod tests {
         let index = pending.queue("a/one.glb", Some("a"), true, (a, 0));
         assert_eq!(index, 3);
         assert!(pending.requested(index).is_none());
+    }
+
+    /// #276: on the Stairway idol platform (start 3) the `l` floor is one flat slab at the rim
+    /// (-48.026), while `h` and the drawn ground dip into craters up to 0.22 m below it. Wolf's
+    /// body stands on the slab; with foot IK on the `h` floors each idle foot's sole ends within
+    /// 2 cm of the `h` ground under it at the crater points, where without it a sole floats more
+    /// than 10 cm above the ground at some point.
+    #[test]
+    fn foot_ik_puts_the_feet_on_the_idol_platform_craters() {
+        let Some(play) = wolf_world() else {
+            return;
+        };
+        let off = story_off_parts(&play.blocks, &play.stories);
+        let floors = foot_ik_ground(&play.cache, &play.blocks, &off).unwrap();
+        let start = Vec3::new(-197.4507, -48.15, 150.7216);
+        let tile = crate::foot_ik::tile_of(start.x, start.z);
+        let h = floors.world_around(tile);
+        let ground =
+            crate::foot_ik::FootGround::fixed(floors.world_around(tile), play.world.clone());
+        let mut library = crate::character::AnimLibrary::load(&play.cache, "c0000").unwrap();
+        let skeleton = library.skeleton.clone();
+        let idle = library.clip("a000_000000").unwrap();
+        let model = skeleton.model_space(&idle.sample(0.0, &skeleton));
+        let legs = crate::foot_ik::legs(&skeleton).unwrap();
+        let mut most_float = 0.0_f32;
+        for (dx, dz) in [
+            (-3.0, -4.0),
+            (3.0, -1.0),
+            (2.0, 0.0),
+            (-3.0, -3.0),
+            (1.0, -2.0),
+        ] {
+            for yaw in [0.0_f32, 1.6, -2.4] {
+                let (x, z) = (start.x + dx, start.z + dz);
+                let feet = play.world.floor(x, z, start.y + 1.0).unwrap();
+                assert!((feet + 48.026).abs() < 0.01, "l floor {feet} at {dx},{dz}");
+                let world = Mat4::from_rotation_translation(
+                    Quat::from_rotation_y(yaw),
+                    Vec3::new(x, feet, z),
+                );
+                let mut ik = crate::foot_ik::FootIk {
+                    enabled: true,
+                    ..Default::default()
+                };
+                let mut posed = model.clone();
+                for _ in 0..90 {
+                    posed = model.clone();
+                    crate::foot_ik::solve(
+                        &skeleton,
+                        &legs,
+                        &mut posed,
+                        world,
+                        &mut ik,
+                        1.0 / 60.0,
+                        |x, z, top| ground.height(x, z, top),
+                    );
+                }
+                for leg in &legs {
+                    // The idle ankle's height over the feet, standing on flat ground.
+                    let lift = model[leg.ankle].w_axis.y;
+                    let before = world.transform_point3(model[leg.ankle].w_axis.truncate());
+                    let after = world.transform_point3(posed[leg.ankle].w_axis.truncate());
+                    let under = h.floor(after.x, after.z, after.y).unwrap();
+                    most_float = most_float.max(before.y - lift - under);
+                    let sole = after.y - lift;
+                    assert!(
+                        (sole - under).abs() < 0.02,
+                        "{dx},{dz} yaw {yaw}: sole {sole:.3} over h {under:.3} (drop {:.3})",
+                        ik.drop
+                    );
+                }
+            }
+        }
+        assert!(
+            most_float > 0.1,
+            "without IK a sole floats {most_float:.3} m at most"
+        );
     }
 }

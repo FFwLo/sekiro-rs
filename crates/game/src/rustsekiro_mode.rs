@@ -125,13 +125,13 @@ fn blocks() -> Vec<String> {
 /// the material with the deep-water rule, the camera's own collision, the ceilings. The second
 /// field is when Wolf last stood on a rideable floor (the riding state, SpEffect 4100); the
 /// third the same world as the enemies see it (play.rs gives them `EnemyGround`: enemy-only
-/// walls and floors, hit filters 11, 16 and 19); the fourth the detailed `h` collision the feet
-/// are cast on where the body stands on an `l` mesh (map_world.rs `foot_world`).
-struct World(Arc<sekiro_sim::collision::CollisionWorld>, std::sync::Mutex<Option<std::time::Instant>>, sekiro_sim::collision::EnemyGround, Option<sekiro_sim::collision::CollisionWorld>);
+/// walls and floors, hit filters 11, 16 and 19); the fourth the ground the feet are cast on, the
+/// detailed `h` floors around Wolf (foot_ik.rs `FootGround`, built on a thread; the play
+/// collision until it is ready).
+struct World(Arc<sekiro_sim::collision::CollisionWorld>, std::sync::Mutex<Option<std::time::Instant>>, sekiro_sim::collision::EnemyGround, Option<crate::foot_ik::FootGround>);
 
 impl World {
-    fn new(world: sekiro_sim::collision::CollisionWorld, feet: Option<sekiro_sim::collision::CollisionWorld>) -> Self {
-        let world = Arc::new(world);
+    fn new(world: Arc<sekiro_sim::collision::CollisionWorld>, feet: Option<crate::foot_ik::FootGround>) -> Self {
         Self(world.clone(), std::sync::Mutex::new(None), sekiro_sim::collision::EnemyGround(world), feet)
     }
 }
@@ -156,10 +156,11 @@ impl rustsekiro::WorldCollision for World {
         sekiro_sim::body::Ground::ceiling(&self.0, feet, rise)
     }
     fn foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
-        match &self.3 {
-            Some(h) => h.floor(x, z, top),
-            None => sekiro_sim::body::Ground::floor(&self.0, x, z, top),
-        }
+        let feet = self.3.as_ref().and_then(|g| {
+            g.follow(x, z);
+            g.height(x, z, top)
+        });
+        feet.or_else(|| sekiro_sim::body::Ground::floor(&self.0, x, z, top))
     }
     fn enemy_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
         sekiro_sim::body::Ground::floor(&self.2, x, z, top)
@@ -225,8 +226,8 @@ fn after(app: &mut App) {
         let layouts = crate::map::world::play_blocks(&cache, &map)?;
         let stories = crate::map::story::load_blocks(&cache, &layouts)?;
         let blocks: Vec<String> = layouts.keys().cloned().collect();
-        let world = crate::map::world::collision_world(&cache, &layouts, &stories)?;
-        let feet = crate::map::world::foot_world(&cache, &layouts)?;
+        let world = Arc::new(crate::map::world::collision_world(&cache, &layouts, &stories)?);
+        let feet = crate::foot_ik::FootGround::load(&cache, &layouts, &stories, world.clone());
         // An idol's warp point: the player part `entity - 980` (play/idol.rs WARP_POINT).
         let warp = match start {
             Start::Idol(e) => layouts
@@ -256,7 +257,7 @@ fn after(app: &mut App) {
                 at = w.floor_hit(x, z, y).map(|(h, _)| Vec3::new(x, h, z));
             }
             warp = i;
-            let w = World::new(w, feet);
+            let w = World::new(w, Some(feet));
             collision = Some(w.0.clone());
             rustsekiro::Terrain::from_world(Arc::new(w)).install();
         }
