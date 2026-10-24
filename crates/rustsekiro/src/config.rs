@@ -2,7 +2,7 @@
 //! Values that Sekiro's data provides are not here; see data.rs.
 
 use bevy::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// All tuning values. The layout mirrors the sections in `config.toml`.
@@ -242,7 +242,10 @@ pub struct PlayerConfig {
     /// 70000 Loaded Shuriken, 71000 Shinobi Firecracker, 72000 Flame Vent, 73000 Loaded Axe,
     /// 74000 Mist Raven, 75000 Sabimaru, 76000 Loaded Umbrella, 77000 Divine Abduction,
     /// 78000 Loaded Spear, 79000 Finger Whistle (+100 per upgrade level).
-    #[serde(default = "default_prosthetics")]
+    /// Left out of config.toml: the first three `owned_tools` in their order, so Z switches
+    /// between the tools the start holds (the game's new game, CharaInitParam 10000, fits none;
+    /// here the start owns `owned_tools`).
+    #[serde(default)]
     pub prosthetics: Vec<i64>,
     /// Learned latent skills (SkillParam ids), e.g. 280 Flowing Water (less posture damage when guarding).
     /// Empty = level-1 Wolf.
@@ -313,8 +316,9 @@ fn default_combat_art() -> i64 {
     5100
 }
 
-fn default_prosthetics() -> Vec<i64> {
-    vec![70000]
+/// The tool slots when config.toml names none: the first three tools owned.
+fn starting_tools(owned: &[i64]) -> Vec<i64> {
+    owned.iter().copied().take(3).collect()
 }
 
 fn default_enemy_chr() -> String {
@@ -331,7 +335,7 @@ fn default_emblems() -> u32 {
 
 impl Default for PlayerConfig {
     fn default() -> Self {
-        Self { gourd_charges: 3, spirit_emblems: default_emblems(), infinite_emblems: false, resurrections: default_resurrections(), combat_art: default_combat_art(), ninjutsu: 0, prosthetics: default_prosthetics(), skills: Vec::new(), skill_points: 0, skill_exp: 0, skill_level: 0, form: 0, items: Vec::new(), quick_items: default_quick_items(), owned_tools: default_owned_tools(), upgrades: Vec::new(), unlock_all_moves: true, sen: default_sen(), attack_power: default_attack_power() }
+        Self { gourd_charges: 3, spirit_emblems: default_emblems(), infinite_emblems: false, resurrections: default_resurrections(), combat_art: default_combat_art(), ninjutsu: 0, prosthetics: starting_tools(&default_owned_tools()), skills: Vec::new(), skill_points: 0, skill_exp: 0, skill_level: 0, form: 0, items: Vec::new(), quick_items: default_quick_items(), owned_tools: default_owned_tools(), upgrades: Vec::new(), unlock_all_moves: true, sen: default_sen(), attack_power: default_attack_power() }
     }
 }
 
@@ -420,7 +424,125 @@ impl GameConfig {
         let path = Self::path();
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
-        toml::from_str(&text).map_err(|e| format!("config.toml has a mistake: {e}"))
+        Self::parse(&text)
+    }
+
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let mut config: GameConfig = toml::from_str(text).map_err(|e| format!("config.toml has a mistake: {e}"))?;
+        let raw: toml::Value = toml::from_str(text).map_err(|e| format!("config.toml has a mistake: {e}"))?;
+        if raw.get("player").and_then(|p| p.get("prosthetics")).is_none() {
+            config.player.prosthetics = starting_tools(&config.player.owned_tools);
+        }
+        Ok(config)
+    }
+}
+
+/// What carries over of Wolf's state between runs and F5 (save.json next to config.toml):
+/// the equipment (tools, art, ninjutsu, quick items), the bag and Sen, the tools made and
+/// upgrades bought, the skills learned and their points. Idol Travel starts this program again
+/// (sekiro-rs's `travel`), so without it every change made in play was lost there and on F5.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub(crate) struct Kept {
+    prosthetics: Vec<i64>,
+    combat_art: i64,
+    ninjutsu: i64,
+    quick_items: Vec<i64>,
+    items: Vec<(i64, u32)>,
+    sen: u32,
+    owned_tools: Vec<i64>,
+    upgrades: Vec<i64>,
+    skills: Vec<i64>,
+    skill_points: u32,
+    skill_exp: u32,
+    skill_level: u32,
+}
+
+impl Kept {
+    pub(crate) fn of(p: &PlayerConfig) -> Self {
+        Kept {
+            prosthetics: p.prosthetics.clone(),
+            combat_art: p.combat_art,
+            ninjutsu: p.ninjutsu,
+            quick_items: p.quick_items.clone(),
+            items: p.items.clone(),
+            sen: p.sen,
+            owned_tools: p.owned_tools.clone(),
+            upgrades: p.upgrades.clone(),
+            skills: p.skills.clone(),
+            skill_points: p.skill_points,
+            skill_exp: p.skill_exp,
+            skill_level: p.skill_level,
+        }
+    }
+
+    pub(crate) fn put(self, p: &mut PlayerConfig) {
+        p.prosthetics = self.prosthetics;
+        p.combat_art = self.combat_art;
+        p.ninjutsu = self.ninjutsu;
+        p.quick_items = self.quick_items;
+        p.items = self.items;
+        p.sen = self.sen;
+        p.owned_tools = self.owned_tools;
+        p.upgrades = self.upgrades;
+        p.skills = self.skills;
+        p.skill_points = self.skill_points;
+        p.skill_exp = self.skill_exp;
+        p.skill_level = self.skill_level;
+    }
+}
+
+/// save.json: the kept state (`now`) and config.toml's values when it was made (`base`).
+#[derive(Serialize, Deserialize)]
+struct SaveFile {
+    base: Kept,
+    now: Kept,
+}
+
+/// config.toml's kept values as last loaded (the next save's `base`).
+#[derive(Resource, Default)]
+pub(crate) struct SaveBase(pub(crate) Kept);
+
+fn save_path() -> PathBuf {
+    crate::paths::root().join("save.json")
+}
+
+/// The kept state over config.toml's: each value the save's, unless config.toml's own changed
+/// since the save was made (an edit to the file, then F5 or a new run, wins). Delete save.json
+/// to start again from config.toml.
+pub(crate) fn merged(file: &Kept, base: &Kept, now: &Kept) -> Kept {
+    let (f, b, n) = (serde_json::to_value(file).unwrap_or_default(), serde_json::to_value(base).unwrap_or_default(), serde_json::to_value(now).unwrap_or_default());
+    let Some(fields) = f.as_object() else { return file.clone() };
+    let out: serde_json::Map<String, serde_json::Value> = fields.iter().map(|(k, fv)| (k.clone(), if b.get(k) != Some(fv) { fv.clone() } else { n.get(k).cloned().unwrap_or_else(|| fv.clone()) })).collect();
+    serde_json::from_value(serde_json::Value::Object(out)).unwrap_or_else(|_| file.clone())
+}
+
+fn read_save(path: &std::path::Path) -> Option<SaveFile> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn write_save_file(path: &std::path::Path, base: &Kept, now: &Kept) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(&SaveFile { base: base.clone(), now: now.clone() }).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Writes save.json when the kept state (or config.toml's under it, after F5) changes. Not in
+/// the tests: they run on config.toml alone.
+fn write_save(config: Res<GameConfig>, base: Res<SaveBase>, mut last: Local<Option<(Kept, Kept)>>) {
+    if cfg!(test) || !(config.is_changed() || base.is_changed()) {
+        return;
+    }
+    let now = Kept::of(&config.player);
+    if last.as_ref().is_some_and(|(b, n)| *b == base.0 && *n == now) {
+        return;
+    }
+    // The first look is the state as loaded: nothing to write yet.
+    if last.replace((base.0.clone(), now.clone())).is_none() {
+        return;
+    }
+    if let Err(e) = write_save_file(&save_path(), &base.0, &now) {
+        warn!("save.json not written: {e}");
     }
 }
 
@@ -428,19 +550,28 @@ pub struct ConfigPlugin;
 
 impl Plugin for ConfigPlugin {
     fn build(&self, app: &mut App) {
-        let config = GameConfig::load().unwrap_or_else(|e| panic!("{e}"));
+        let mut config = GameConfig::load().unwrap_or_else(|e| panic!("{e}"));
+        let base = Kept::of(&config.player);
+        if !cfg!(test) {
+            if let Some(save) = read_save(&save_path()) {
+                merged(&base, &save.base, &save.now).put(&mut config.player);
+                info!("save.json: Wolf's equipment, bag and skills carried over");
+            }
+        }
         app.insert_resource(config)
-            .add_systems(Update, reload_on_f5.run_if(resource_exists::<ButtonInput<KeyCode>>));
+            .insert_resource(SaveBase(base))
+            .add_systems(Update, reload_on_f5.run_if(resource_exists::<ButtonInput<KeyCode>>))
+            .add_systems(Last, write_save);
     }
 }
 
-fn reload_on_f5(keys: Res<ButtonInput<KeyCode>>, mut config: ResMut<GameConfig>) {
+fn reload_on_f5(keys: Res<ButtonInput<KeyCode>>, mut config: ResMut<GameConfig>, mut base: ResMut<SaveBase>) {
     if !keys.just_pressed(KeyCode::F5) {
         return;
     }
     match GameConfig::load() {
         Ok(new_config) => {
-            *config = reloaded(&config, new_config);
+            *config = reloaded(&config, new_config, &mut base.0);
             info!("config.toml reloaded");
         }
         // A typo in the file keeps the old values instead of crashing the game.
@@ -451,10 +582,15 @@ fn reload_on_f5(keys: Res<ButtonInput<KeyCode>>, mut config: ResMut<GameConfig>)
 /// The file's values, but the fight in progress stays: the encounter picker (enemy.rs
 /// spawn_encounter) sets enemy.chr / npc_row / group in memory only, and Combat.kinds holds that
 /// encounter; taking the file's back made the next reset spawn its group into the picked fight.
-fn reloaded(old: &GameConfig, mut new: GameConfig) -> GameConfig {
+/// Wolf's kept state (`Kept`: equipment, bag, skills) stays too, unless the file's own value
+/// changed since the last load (`base`, updated to the file's).
+pub(crate) fn reloaded(old: &GameConfig, mut new: GameConfig, base: &mut Kept) -> GameConfig {
     new.enemy.chr = old.enemy.chr.clone();
     new.enemy.npc_row = old.enemy.npc_row;
     new.enemy.group = old.enemy.group.clone();
+    let file = Kept::of(&new.player);
+    merged(&file, base, &Kept::of(&old.player)).put(&mut new.player);
+    *base = file;
     new
 }
 
@@ -470,7 +606,8 @@ mod tests {
         let mut file = super::GameConfig::load().unwrap();
         file.enemy.chr = "c1020".into();
         file.enemy.group.push(crate::config::GroupEnemy { chr: "c1010".into(), npc_row: Some(10102010), at: None, msb: Some(1110236) });
-        let got = super::reloaded(&old, file);
+        let mut base = super::Kept::of(&file.player);
+        let got = super::reloaded(&old, file, &mut base);
         assert_eq!((got.enemy.chr.as_str(), got.enemy.npc_row, got.enemy.group.len()), ("c1010", Some(10102010), 0));
     }
 

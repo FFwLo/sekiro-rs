@@ -1,18 +1,26 @@
 //! The Sculptor on the Construct: the game's c7010 model, skeleton and clips. Talk opens the
 //! existing fitting / upgrade menus; it never rests Wolf or changes his idol checkpoint.
 //! This is a service NPC, not the story's ESD dialogue / gifts / sake progression.
+//! In sekiro-rs's open world (`embed`) he is the map's own Sculptor: the MSB c7010 its events
+//! stream in (enemy/world.rs; m11_00's 1100720 at the Dilapidated Temple), followed by
+//! `follow_world`. gap: there his visit clips (20001 / 21003 / 20002) are not played; his own
+//! think row keeps him as the map has him.
 
 use bevy::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::actor::{Actor, ActorSet, Side};
+use crate::actor::Actor;
+#[cfg(any(feature = "host", test))]
+use crate::actor::{ActorSet, Side};
 use crate::config::GameConfig;
 use crate::data::{CharData, Combat};
 use crate::idol::{Cmd, Phase};
 use crate::player::{Player, CAPSULE_HALF_HEIGHT};
 
 pub(crate) const CHR: &str = "c7010";
+#[cfg(any(feature = "host", test))]
 pub(crate) const NPC_ROW: i64 = 70100080;
+#[cfg(any(feature = "host", test))]
 /// Outside the replaceable enemy-kind indices: encounter changes must not turn him into a boss.
 pub(crate) const KIND: usize = crate::data::NPC_KIND;
 pub(crate) const POS: Vec3 = Vec3::new(-7.0, 0.0, 3.0);
@@ -27,15 +35,47 @@ const SIT_DOWN: &str = "Event711200";
 const SITTING: &str = "Event711201";
 const GET_UP: &str = "Event711202";
 static PRESENT: AtomicBool = AtomicBool::new(false);
+/// The open world's Sculptor: his feet and yaw (`follow_world`), None when not streamed in.
+static WORLD: std::sync::Mutex<Option<(Vec3, f32)>> = std::sync::Mutex::new(None);
 
+fn world_spot() -> Option<(Vec3, f32)> {
+    WORLD.lock().ok().and_then(|w| *w)
+}
+
+/// Is this the Construct (where the Sculptor of `SculptorPlugin` sits)?
+#[cfg(any(feature = "host", test))]
+fn on_construct(config: &GameConfig) -> bool {
+    crate::map::map_id(config).as_deref() == Some(crate::sandbox::CONSTRUCT_ID)
+}
+
+#[cfg(not(any(feature = "host", test)))]
+fn on_construct(_config: &GameConfig) -> bool {
+    false
+}
+
+#[cfg(any(feature = "host", test))]
 pub(crate) use crate::encounter::Npc as Sculptor;
 
+fn in_reach_of(feet: Vec3, pos: Vec3) -> bool {
+    (feet - pos).with_y(0.0).length() < REACH && (feet.y - pos.y).abs() < HEIGHT
+}
+
+#[cfg(test)]
 fn in_reach(feet: Vec3) -> bool {
-    (feet - POS).with_y(0.0).length() < REACH && (feet.y - POS.y).abs() < HEIGHT
+    in_reach_of(feet, POS)
 }
 
 pub(crate) fn near(feet: Vec3) -> bool {
-    PRESENT.load(Ordering::Relaxed) && in_reach(feet)
+    world_spot().is_some_and(|(pos, _)| in_reach_of(feet, pos)) || PRESENT.load(Ordering::Relaxed) && in_reach_of(feet, POS)
+}
+
+/// In sekiro-rs's open world: the map's own Sculptor (MSB c7010, his Part.Enemy row 70100080)
+/// as enemy/world.rs streamed him in, alive, is the one Wolf talks to.
+pub(crate) fn follow_world(combat: Res<Combat>, chars: Query<(&Actor, &Transform), With<crate::enemy::world::WorldChar>>) {
+    let spot = chars.iter().find(|(a, _)| a.hp > 0.0 && combat.kinds.get(a.kind).is_some_and(|k| k.foe.chr == CHR)).map(|(a, tf)| (tf.translation - Vec3::Y * CAPSULE_HALF_HEIGHT, a.yaw));
+    if let Ok(mut w) = WORLD.lock() {
+        *w = spot;
+    }
 }
 
 /// Before the idol and traversal in player::decide. Finish sitting down before opening the
@@ -44,13 +84,14 @@ pub(crate) fn tick(p: &mut Player, a: &mut Actor, data: &CharData, tf: &mut Tran
     let feet = tf.translation - Vec3::Y * CAPSULE_HALF_HEIGHT;
     let mut ended = ended;
     if !p.seat.sculptor {
-        if interact && crate::map::map_id(config).as_deref() == Some(crate::sandbox::CONSTRUCT_ID)
-            && near(feet) && p.seat.idol.is_none() && !a.airborne && a.hp > 0.0
-            && crate::player::is_free(&a.state) && a.play_state(data, SIT_DOWN)
+        // The open world's Sculptor, else the Construct's.
+        let at = world_spot().or_else(|| (on_construct(config) && PRESENT.load(Ordering::Relaxed)).then_some((POS, YAW))).filter(|(pos, _)| in_reach_of(feet, *pos));
+        if let Some((pos, yaw)) = at.filter(|_| interact && p.seat.idol.is_none() && !a.airborne && a.hp > 0.0 && crate::player::is_free(&a.state))
+            && a.play_state(data, SIT_DOWN)
         {
-            let seat = POS + Vec3::new(-YAW.sin(), 0.0, -YAW.cos()) * SEAT;
+            let seat = pos + Vec3::new(-yaw.sin(), 0.0, -yaw.cos()) * SEAT;
             tf.translation = seat.with_y(feet.y) + Vec3::Y * CAPSULE_HALF_HEIGHT;
-            a.yaw = YAW + std::f32::consts::PI;
+            a.yaw = yaw + std::f32::consts::PI;
             p.seat.sculptor = true;
             p.seat.phase = Phase::Kneeling;
             p.seat.cmd = None;
@@ -60,7 +101,8 @@ pub(crate) fn tick(p: &mut Player, a: &mut Actor, data: &CharData, tf: &mut Tran
             return false;
         }
     }
-    if a.hp <= 0.0 || !in_reach(feet) || ![SIT_DOWN, SITTING, GET_UP].contains(&a.state.as_str()) {
+    let pos = world_spot().map_or(POS, |(pos, _)| pos);
+    if a.hp <= 0.0 || !in_reach_of(feet, pos) || ![SIT_DOWN, SITTING, GET_UP].contains(&a.state.as_str()) {
         p.seat.sculptor = false;
         p.seat.open = false;
         p.seat.cmd = None;
@@ -89,6 +131,7 @@ pub(crate) fn tick(p: &mut Player, a: &mut Actor, data: &CharData, tf: &mut Tran
     true
 }
 
+#[cfg(any(feature = "host", test))]
 fn spawn(mut commands: Commands, combat: Res<Combat>) {
     PRESENT.store(false, Ordering::Relaxed);
     let Some(kind) = combat.sculptor.as_ref() else { return };
@@ -114,6 +157,7 @@ fn spawn(mut commands: Commands, combat: Res<Combat>) {
 /// While Wolf sits he works on the prosthetic: 20001 (event 11105721, with Wolf's 711200), the
 /// 21003 loop (its prosthetic mask and tool sounds; 20000 is the dragonrot cough), then
 /// 20002 (with 711202) back to ordinary sitting outside the menu (the user's preference).
+#[cfg(any(feature = "host", test))]
 fn visit_animation(a: &mut Actor, data: &CharData, visiting: bool) {
     let ended = a.t >= data.length(&a.anim);
     match (a.state.as_str(), visiting, ended) {
@@ -129,6 +173,7 @@ fn visit_animation(a: &mut Actor, data: &CharData, visiting: bool) {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn carving(combat: Res<Combat>, wolf: Query<&Player>, mut npc: Query<(&mut Actor, &mut Transform, &mut Visibility), With<Sculptor>>) {
     let visible = crate::place::loaded_map().as_deref().is_none_or(|id| id == crate::sandbox::CONSTRUCT_ID);
     let visiting = visible && wolf.iter().any(|p| p.seat.sculptor && p.seat.phase != Phase::Leaving);
@@ -145,6 +190,7 @@ fn carving(combat: Res<Combat>, wolf: Query<&Player>, mut npc: Query<(&mut Actor
 }
 
 /// Screenshot harness: open the real interaction from nearby, with no desktop input.
+#[cfg(any(feature = "host", test))]
 fn shot_visit(config: Res<GameConfig>, combat: Res<Combat>, mut done: Local<bool>, mut wolf: Query<(&mut Player, &mut Actor, &mut Transform)>) {
     if *done || std::env::var_os("SHINOBI_SCULPTOR_SHOT").is_none() || !PRESENT.load(Ordering::Relaxed) {
         return;
@@ -161,8 +207,10 @@ fn shot_visit(config: Res<GameConfig>, combat: Res<Combat>, mut done: Local<bool
     tick(&mut p, &mut a, &combat.player, &mut tf, true, false, &config);
 }
 
+#[cfg(any(feature = "host", test))]
 pub struct SculptorPlugin;
 
+#[cfg(any(feature = "host", test))]
 impl Plugin for SculptorPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn)

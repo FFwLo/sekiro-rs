@@ -92,7 +92,7 @@ mod map_lights;
 mod menu;
 #[cfg(any(feature = "host", test))]
 mod sandbox;
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "embed")]
 mod sculptor;
 mod seat;
 #[cfg(any(feature = "host", test))]

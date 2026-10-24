@@ -206,7 +206,6 @@ pub fn guides_for(p: &Player, a: &Actor, feet: Vec3, edges: &[crate::traversal::
         if crate::pickups::pickup_near(feet).is_some() {
             return vec![PICK_UP];
         }
-        #[cfg(feature = "host")]
         if crate::sculptor::near(feet) {
             return vec![TALK];
         }

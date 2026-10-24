@@ -528,7 +528,7 @@ fn equip_choices(slot: usize, config: &crate::config::GameConfig, combat: &crate
             ids.dedup();
             ids.into_iter().filter(|id| texts.weapon_name.contains_key(&(*id as u32))).map(Slot::Weapon).collect()
         }
-        3 => (5100..=7700).step_by(100).filter(|id| texts.weapon_name.contains_key(&(*id as u32))).map(Slot::Weapon).collect(),
+        3 => (5100..=7700).step_by(100).filter(|id| texts.weapon_name.contains_key(&(*id as u32)) && art_learned(*id, config, combat)).map(Slot::Weapon).collect(),
         4..=8 => {
             // The gourd and every consumable held that has a use (items.rs use_state).
             let mut v = vec![Slot::Goods(3000, 0)];
@@ -542,6 +542,13 @@ fn equip_choices(slot: usize, config: &crate::config::GameConfig, combat: &crate
         9 => crate::ninjutsu::NINJUTSU.iter().filter(|&&id| config.player.unlock_all_moves || crate::items::count(config, id) > 0).map(|&id| Slot::Goods(id, 0)).collect(),
         _ => Vec::new(),
     }
+}
+
+/// A combat art goes in the art slot once a learned skill gives it: a SkillParam row in
+/// player.skills whose acquireWeaponId is the art (210 -> 5300 Ichimonji; the Skills tab's rule:
+/// every art with `unlock_all_moves`, the whole tree).
+fn art_learned(art: i64, config: &crate::config::GameConfig, combat: &crate::data::Combat) -> bool {
+    config.player.unlock_all_moves || config.player.skills.iter().any(|&s| combat.param("SkillParam", s)["acquireWeaponId"].as_i64() == Some(art))
 }
 
 /// Is this choice equipped (in any slot of its kind)?
@@ -913,7 +920,9 @@ fn run_game_menu(
     let gear = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (&config.player.prosthetics, config.player.combat_art).hash(&mut h);
+        // The quick items and the ninjutsu too: equipping one left the picker as it was (no
+        // equipped mark) until the cursor moved.
+        (&config.player.prosthetics, config.player.combat_art, &config.player.quick_items, config.player.ninjutsu).hash(&mut h);
         h.finish()
     };
     let key = (menu.tab, menu.index + menu.top * 1000, menu.cat, menu.pick, gear);
@@ -968,5 +977,105 @@ mod scroll_tests {
         assert_eq!(crate::menu::wheel_step(0, 3, n), 0);
         assert_eq!(crate::menu::wheel_step(10, -5, n), 11);
         assert_eq!(crate::menu::wheel_step(4, -2, n), 6);
+    }
+}
+
+/// Issue 280: tools, arts and quick items equipped through the menu (`equip`), as the game's
+/// default build (embed, no `host`) runs them.
+#[cfg(test)]
+mod equip_tests {
+    use super::*;
+    use crate::sim_tests::{app, Action, Enemy, PadInput, Player};
+
+    /// The tool slots config.toml leaves out are the first three tools owned (only the Loaded
+    /// Shuriken was fitted, so Z did nothing), and a tool equipped in a menu slot is the one Z
+    /// switches to.
+    #[test]
+    fn owned_tools_fill_the_slots_and_z_switches_to_an_equipped_one() {
+        let text = std::fs::read_to_string(crate::paths::root().join("config.toml")).unwrap();
+        let text: String = text.lines().filter(|l| !l.trim_start().starts_with("prosthetics")).map(|l| format!("{l}\n")).collect();
+        let text = crate::config::set_key(&text, "player", "owned_tools", "[70000, 71000, 73000, 78000]");
+        let file = crate::config::GameConfig::parse(&text).unwrap();
+        assert_eq!(file.player.prosthetics, vec![70000, 71000, 73000]);
+        let mut app = app();
+        {
+            let world = app.world_mut();
+            let texts = ItemTexts::load();
+            let mut config = world.resource::<crate::config::GameConfig>().clone();
+            config.player.prosthetics = file.player.prosthetics.clone();
+            config.player.owned_tools = file.player.owned_tools.clone();
+            let offered = equip_choices(1, &config, world.resource::<crate::data::Combat>(), &texts);
+            assert!(offered.iter().any(|s| matches!(s, Slot::Weapon(78000))), "the Loaded Spear is owned");
+            // The second slot: the Loaded Spear in place of the Shinobi Firecracker.
+            equip(1, &Slot::Weapon(78000), &mut config);
+            assert_eq!(config.player.prosthetics, vec![70000, 78000, 73000]);
+            *world.resource_mut::<crate::config::GameConfig>() = config;
+            let mut q = world.query_filtered::<&mut Transform, With<Enemy>>();
+            q.single_mut(world).unwrap().translation.z = 30.0;
+        }
+        for _ in 0..30 {
+            app.update();
+        }
+        app.world_mut().resource_mut::<PadInput>().press(Action::SwitchTool);
+        app.update();
+        let world = app.world_mut();
+        let slot = world.query::<&Player>().single(world).unwrap().tool_slot;
+        let tool = crate::player::equipped_tool(world.resource::<crate::data::Combat>(), world.resource::<crate::config::GameConfig>(), slot).map(|t| t.id);
+        assert_eq!((slot, tool), (1, Some(78000)));
+    }
+
+    /// The art slot offers the combat arts a learned skill gives (SkillParam acquireWeaponId),
+    /// every art only with `unlock_all_moves` (the whole tree), as the Skills tab lists them.
+    #[test]
+    fn the_art_picker_offers_only_learned_arts() {
+        let app = app();
+        let combat = app.world().resource::<crate::data::Combat>();
+        let texts = ItemTexts::load();
+        let mut config = app.world().resource::<crate::config::GameConfig>().clone();
+        config.player.unlock_all_moves = false;
+        config.player.skills.clear();
+        assert!(equip_choices(3, &config, combat, &texts).is_empty(), "no art learned, none to equip");
+        // Ichimonji (5300) and the skill row that teaches it.
+        let skill = combat.params["SkillParam"].as_object().unwrap().iter().find(|(_, r)| r["acquireWeaponId"].as_i64() == Some(5300)).map(|(id, _)| id.parse::<i64>().unwrap()).expect("a skill gives Ichimonji");
+        config.player.skills.push(skill);
+        let arts: Vec<i64> = equip_choices(3, &config, combat, &texts).iter().filter_map(|s| if let Slot::Weapon(id) = s { Some(*id) } else { None }).collect();
+        assert_eq!(arts, vec![5300]);
+        equip(3, &Slot::Weapon(5300), &mut config);
+        assert_eq!(config.player.combat_art, 5300);
+        config.player.unlock_all_moves = true;
+        assert!(equip_choices(3, &config, combat, &texts).len() > 1);
+    }
+
+    /// What play changes (a quick item equipped and one used, another art) survives F5 (config.rs
+    /// `reloaded`) and a new run (Idol Travel starts the program again: save.json over
+    /// config.toml, `merged`); a value edited in config.toml in between wins.
+    #[test]
+    fn equipment_and_bag_survive_f5_and_a_new_run() {
+        use crate::config::{merged, reloaded, GameConfig, Kept};
+        let file = GameConfig::load().unwrap();
+        let base = Kept::of(&file.player);
+        let mut play = file.clone();
+        crate::items::add(&mut play, 3020, 2);
+        equip(5, &Slot::Goods(3020, 0), &mut play);
+        crate::items::spend(&mut play, 3020);
+        let art = if file.player.combat_art == 5300 { 5400 } else { 5300 };
+        equip(3, &Slot::Weapon(art), &mut play);
+        let kept = Kept::of(&play.player);
+        assert_ne!(kept, base);
+        // F5: config.toml unchanged, play's state stays.
+        let mut b = base.clone();
+        let got = reloaded(&play, file.clone(), &mut b);
+        assert_eq!(Kept::of(&got.player), kept);
+        assert_eq!(crate::items::in_slot(&got, 1), 3020);
+        // A new run: config.toml as before, the save over it.
+        assert_eq!(merged(&base, &base, &kept), kept);
+        // config.toml's art edited since the save: the file's art, the rest from the save.
+        let mut edited = file.clone();
+        edited.player.combat_art = 5500;
+        let mut next = edited.clone();
+        merged(&Kept::of(&edited.player), &base, &kept).put(&mut next.player);
+        assert_eq!(next.player.combat_art, 5500);
+        assert_eq!(next.player.quick_items, play.player.quick_items);
+        assert_eq!(next.player.items, play.player.items);
     }
 }

@@ -1241,10 +1241,7 @@ const IDOL_FACING: f32 = std::f32::consts::PI;
 /// This game's world hooks for the core (encounter.rs): items on the ground (pickups.rs), the
 /// Sculptor (sculptor.rs) then the idols, the idols as checkpoints.
 pub fn world_hooks() -> crate::encounter::WorldHooks {
-    #[cfg(feature = "host")]
     let interactions: &'static [crate::encounter::Interaction] = &[crate::sculptor::tick, tick];
-    #[cfg(not(feature = "host"))]
-    let interactions: &'static [crate::encounter::Interaction] = &[tick];
     crate::encounter::WorldHooks { take_item: crate::pickups::take_item, interactions, respawn_at }
 }
 
@@ -1270,7 +1267,7 @@ impl Plugin for IdolPlugin {
         app.insert_resource(crate::form::FormTexts::load());
         app.insert_resource(IdolMenu { page, region: if page == Page::Travel { 1 } else { 0 }, tree, ..default() })
             .add_systems(Startup, spawn_idols)
-            .add_systems(Update, (open_menu, start_checkpoint))
+            .add_systems(Update, (open_menu, start_checkpoint, crate::sculptor::follow_world))
             .add_systems(PreUpdate, run_idol_menu.after(crate::menu::MenuInput));
     }
 }
