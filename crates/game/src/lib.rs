@@ -29,7 +29,8 @@
 //!
 //! As a library (`sekiro_rs`), `map` loads an area into another app's Bevy `App`. The flags
 //! above come from the command line [`run`] starts with, or from [`set_args`] in a host; the
-//! library never reads a host's own command line.
+//! library never reads a host's own command line. A host calls [`mark_process_start`] at its
+//! start so the library's load timings count from there.
 
 mod arena;
 mod arena_b;
@@ -489,10 +490,19 @@ fn play_options_with(args: &[String], datasets: &std::path::Path) -> anyhow::Res
     })
 }
 
-/// When this process started, for load timings measured from launch.
+/// When this process started, for load timings measured from launch: the first
+/// [`mark_process_start`], else the first timing read.
 fn process_start() -> std::time::Instant {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     *START.get_or_init(std::time::Instant::now)
+}
+
+/// Starts the clock the load timings ("map setup: ... at 4.2 s") count from, and returns its
+/// start. [`run`] calls it first; a host that loads maps through the library calls it at its
+/// own start, else its times count from the library's first timing. Later calls keep the first
+/// start.
+pub fn mark_process_start() -> std::time::Instant {
+    process_start()
 }
 
 /// Seconds since this process started.
@@ -501,7 +511,7 @@ fn since_start() -> f32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    process_start();
+    mark_process_start();
     let _ = ARGS.set(std::env::args().collect());
     dispatch()?;
     menu::relaunch()?;

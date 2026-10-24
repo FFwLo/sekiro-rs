@@ -26,3 +26,10 @@ fn a_host_gives_the_library_its_flags() {
     assert!(!connects("m11_00_00_00"));
     assert!(!sekiro_rs::set_args(Vec::<String>::new()));
 }
+
+/// The load-timing clock starts at a host's first `mark_process_start` and stays there.
+#[test]
+fn a_host_starts_the_load_clock_once() {
+    let start = sekiro_rs::mark_process_start();
+    assert_eq!(sekiro_rs::mark_process_start(), start);
+}
