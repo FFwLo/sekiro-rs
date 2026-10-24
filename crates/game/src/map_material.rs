@@ -297,7 +297,8 @@ impl From<&MapLayers> for MapPipelineKey {
             game: layers.game.flags.y != 0,
             native_direct: crate::lighting::native_lights(),
             camera_fade: layers.camera_fade.x > 0.
-                || *LEGACY.get_or_init(|| std::env::args().any(|a| a == "--legacy-camera-fade")),
+                || *LEGACY
+                    .get_or_init(|| crate::args().iter().any(|a| a == "--legacy-camera-fade")),
         }
     }
 }

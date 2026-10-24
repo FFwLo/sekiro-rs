@@ -400,7 +400,7 @@ fn validate(d: &Dest, kit: &sekiro_sim::kit::Kit) -> anyhow::Result<()> {
     let kit = serde_json::to_string(kit)?;
     let mut cli = vec!["sekiro-rs".to_string()];
     cli.extend(travel_args(
-        std::env::args().skip(1),
+        crate::args().iter().skip(1).cloned(),
         &d.map,
         d.entity,
         &kit,
@@ -672,7 +672,12 @@ fn depart(mut sim: NonSendMut<Sim>, mut exit: MessageWriter<AppExit>) {
             return;
         }
     };
-    let args = travel_args(std::env::args().skip(1), &map_of(entity), entity, &kit);
+    let args = travel_args(
+        crate::args().iter().skip(1).cloned(),
+        &map_of(entity),
+        entity,
+        &kit,
+    );
     info!(
         "idol travel: relaunching on {} at idol {entity} (warp point {})",
         map_of(entity),

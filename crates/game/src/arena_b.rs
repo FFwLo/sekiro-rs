@@ -55,7 +55,7 @@ pub fn install(app: &mut App, cache: &Path, map: &str) -> anyhow::Result<()> {
         .init_resource::<ArenaVisibility>()
         .insert_resource(StoryHour {
             initial,
-            explicit: std::env::args().any(|a| a == "--hour"),
+            explicit: crate::args().iter().any(|a| a == "--hour"),
             legacy_sky: crate::map::sky::legacy_selection(),
         })
         .init_resource::<Scene>()
@@ -113,7 +113,8 @@ fn visibility(
 
 fn effects(scene: Res<Scene>, effects: Res<Effects>, mut fx: ResMut<crate::fxr::FxrPlayer>) {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let disabled = *DISABLED.get_or_init(|| std::env::args().any(|a| a == "--no-arena-effects"));
+    let disabled =
+        *DISABLED.get_or_init(|| crate::args().iter().any(|a| a == "--no-arena-effects"));
     for effect in &effects.0 {
         // An absent entry after event restart releases the previous scene's hold.
         let on = scene

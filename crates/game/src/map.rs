@@ -630,8 +630,8 @@ impl DeferredMap {
             .and_then(Path::parent)
             .context("map folder has no cache above it")?;
         let world = world::MapWorld::load(cache, &id, &format!("maps/{id}/"))?;
-        let args: Vec<String> = std::env::args().collect();
-        let lights = LocalLights::load_world(dir, &args, &world)?;
+        let args = crate::args();
+        let lights = LocalLights::load_world(dir, args, &world)?;
         Ok(Self {
             world,
             stories: story::MapStory::default(),
@@ -810,7 +810,7 @@ pub fn add_map(app: &mut App, dir: &Path, scene: MapScene, stories: story::MapSt
     let connected = world::connects(&id)
         && scene.within.is_none()
         && !app.world().contains_resource::<world::ArenaMap>()
-        && !std::env::args().any(|a| a == "--arena");
+        && !crate::args().iter().any(|a| a == "--arena");
     // Only a connected world loads later; a map alone loads here as on the command line.
     let deferred = connected && app.world().contains_resource::<DeferredWorld>();
     if connected {
@@ -862,12 +862,12 @@ pub fn add_map(app: &mut App, dir: &Path, scene: MapScene, stories: story::MapSt
     app.init_resource::<crate::lighting::fog::FogSelection>();
     crate::map_fx::install(app, dir, deferred)?;
     app.init_resource::<crate::lighting_selection::RegionSelection>();
-    let args: Vec<_> = std::env::args().collect();
-    let arena_name = crate::arg_value(&args, "--arena");
+    let args = crate::args();
+    let arena_name = crate::arg_value(args, "--arena");
     let arena = arena_name
         .as_deref()
         .and_then(|name| sekiro_sim::arena::ArenaSpec::by_name(name).ok());
-    let story = story::selection(&args);
+    let story = story::selection(args);
     let mut selection = crate::lighting_selection::select(cache, &id, story.as_deref(), arena)?;
     if scene.hour.is_finite() {
         selection.override_hour(scene.hour, args.iter().any(|a| a == "--hour"));
@@ -919,7 +919,7 @@ pub fn add_map(app: &mut App, dir: &Path, scene: MapScene, stories: story::MapSt
         ..default()
     };
     // This flag is shared by viewer and play without changing the play-mode options.
-    if !std::env::args().any(|a| a == "--no-env-probe")
+    if !crate::args().iter().any(|a| a == "--no-env-probe")
         && let Ok(bytes) = std::fs::read(dir.join("env.json"))
     {
         let env: Value = serde_json::from_slice(&bytes).context("reading env.json")?;
@@ -975,7 +975,7 @@ pub fn add_map(app: &mut App, dir: &Path, scene: MapScene, stories: story::MapSt
     crate::lighting::install_irradiance(app, dir, &probes)?;
     stage("irradiance volumes");
     app.insert_resource(probes);
-    let args: Vec<_> = std::env::args().collect();
+    let args = crate::args();
     if args
         .iter()
         .any(|a| a == "--visual-stats" || a == "--profile-systems")
@@ -1002,14 +1002,14 @@ pub fn add_map(app: &mut App, dir: &Path, scene: MapScene, stories: story::MapSt
         ));
         crate::perf_log::install_render_probe(app);
     }
-    map_material::install(app, &scene.prefix, dir, &args);
+    map_material::install(app, &scene.prefix, dir, args);
     crate::vram::install(app);
     crate::map_fog_surface::install(app, &scene.prefix);
     crate::map_grass::install(app, dir, &scene.prefix)?;
     stage("materials and grass");
-    app.insert_resource(ShadowSettings::from_args(&gparam, hour, &args)?);
+    app.insert_resource(ShadowSettings::from_args(&gparam, hour, args)?);
     if !deferred {
-        LocalLights::install(app, dir, &args)?;
+        LocalLights::install(app, dir, args)?;
     }
     app.insert_resource(ClearColor(SKY))
         .insert_resource(GlobalAmbientLight {
@@ -1319,7 +1319,7 @@ fn spawn_map(
     pending.started_at = Some(Instant::now());
 
     let scene = &layout.scene;
-    let far_enabled = !std::env::args().any(|a| a == "--no-far-scenery");
+    let far_enabled = !crate::args().iter().any(|a| a == "--no-far-scenery");
     if let Some(mut connected) = connected {
         world::spawn(&mut commands, &assets, &mut connected, scene, &mut pending);
     } else if !scene.no_pieces {

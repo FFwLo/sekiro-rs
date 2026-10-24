@@ -75,11 +75,6 @@ static FRAME_SAMPLES: std::sync::Mutex<SystemSamples> =
 
 pub struct SystemTimer(Option<(&'static str, Instant)>);
 
-pub(crate) fn args() -> &'static [String] {
-    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    ARGS.get_or_init(|| std::env::args().collect())
-}
-
 pub(crate) fn profile_systems() -> bool {
     sekiro_sim::perf::enabled()
 }
@@ -651,7 +646,8 @@ fn count_draw_batches(
 }
 
 pub fn enabled() -> bool {
-    args().iter().any(|a| a == "--perf") || std::env::var("PLAY_LOG_PERF").is_ok_and(|v| v == "1")
+    crate::args().iter().any(|a| a == "--perf")
+        || std::env::var("PLAY_LOG_PERF").is_ok_and(|v| v == "1")
 }
 
 pub(crate) fn scene_counts(
@@ -696,7 +692,7 @@ macro_rules! register {
         if crate::perf_log::enabled() {
             let probe = crate::perf_log::install_render_probe(&mut $app);
             $app.insert_resource(crate::perf_log::PerfLog::open()?)
-                .insert_resource(crate::perf_log::PerfTour::from_args(crate::perf_log::args())?)
+                .insert_resource(crate::perf_log::PerfTour::from_args(crate::args())?)
                 .insert_resource(probe)
                 .add_systems(Last, crate::perf_log::scene_counts)
                 .add_systems(FixedUpdate, apply_perf_tour.before(simulate))

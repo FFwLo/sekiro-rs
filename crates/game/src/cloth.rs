@@ -65,7 +65,7 @@ const MAX_DT: f32 = 1.0 / 20.0;
 pub fn plugin(cache: PathBuf) -> ClothPlugin {
     ClothPlugin {
         cache,
-        enabled: !std::env::args().any(|a| a == "--no-cloth"),
+        enabled: !crate::args().iter().any(|a| a == "--no-cloth"),
     }
 }
 

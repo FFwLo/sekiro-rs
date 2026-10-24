@@ -317,7 +317,7 @@ impl Plugin for GameAudioPlugin {
                 app.add_systems(Update, attach_listener);
             }
         }
-        let level = volume_arg(&std::env::args().collect::<Vec<_>>());
+        let level = volume_arg(crate::args());
         let mut library = SoundLibrary::load(&self.cache, !use_fmod);
         if let Some((_, npc_param)) = &self.enemy {
             library.hit_sounds(*npc_param);

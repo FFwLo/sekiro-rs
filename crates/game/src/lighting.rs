@@ -63,7 +63,7 @@ impl Plugin for PostEffectsPlugin {
 /// Load authored strips as unorm data, even though PNG loaders normally assume sRGB.
 pub fn install_post_effects(app: &mut App, dir: &std::path::Path) -> anyhow::Result<()> {
     install_probe_residency(app);
-    let args: Vec<_> = std::env::args().collect();
+    let args = crate::args();
     let mut effects = MapPostEffects {
         no_grading: args.iter().any(|a| a == "--no-grading"),
         no_bloom: args.iter().any(|a| a == "--no-bloom"),
@@ -849,7 +849,7 @@ pub fn install_irradiance(
             .element_product()
             .total_cmp(&a.size.unwrap().element_product())
     });
-    let enabled = !std::env::args().any(|a| a == "--no-giiv");
+    let enabled = !crate::args().iter().any(|a| a == "--no-giiv");
     let indices: std::collections::BTreeMap<_, _> = probes
         .available
         .iter()
@@ -1140,7 +1140,8 @@ pub(crate) fn apply_probes(
     // The probes are captures from points inside the level, so as a sky they show nearby
     // scenery blown up behind the world; the real sky is the map's dome meshes. Lighting only,
     // unless `--probe-sky` asks to see the capture for debugging.
-    let show_sky = *probe_sky.get_or_insert_with(|| std::env::args().any(|a| a == "--probe-sky"));
+    let show_sky =
+        *probe_sky.get_or_insert_with(|| crate::args().iter().any(|a| a == "--probe-sky"));
     // Stable enclosing fallback rather than a camera-driven region hard cut.
     if *last_env_bank != Some(selection.0[3]) {
         *last_env_bank = Some(selection.0[3]);

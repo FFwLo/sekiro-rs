@@ -115,11 +115,11 @@ pub fn load_blocks(cache: &Path, layouts: &BTreeMap<String, Value>) -> Result<Ma
 
 pub fn load(cache: &Path, map: &str, layout: &Value) -> Result<Option<StoryMap>> {
     // Diagnostic control for paired hole-sweep runs with identical loaded geometry.
-    if std::env::args().any(|arg| arg == "--no-map-story") {
+    if crate::args().iter().any(|arg| arg == "--no-map-story") {
         return Ok(None);
     }
-    let args: Vec<_> = std::env::args().collect();
-    let Some(state) = initial_state(cache, map, selection(&args).as_deref())? else {
+    let args = crate::args();
+    let Some(state) = initial_state(cache, map, selection(args).as_deref())? else {
         return Ok(None);
     };
     anyhow::ensure!(

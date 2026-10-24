@@ -31,8 +31,7 @@ pub(crate) fn install(app: &mut App) {
     if crate::perf_log::enabled() {
         app.insert_resource(MemoryClock {
             start: Instant::now(),
-            limit: crate::arg_value(crate::perf_log::args(), "--perf-seconds")
-                .and_then(|v| v.parse().ok()),
+            limit: crate::arg_value(crate::args(), "--perf-seconds").and_then(|v| v.parse().ok()),
         })
         .add_systems(Last, cpu_assets);
     }
@@ -93,8 +92,7 @@ impl Budget {
 fn choose_budget(adapter: Res<RenderAdapterInfo>, mut budget: ResMut<Budget>) {
     budget.memory = VideoMemory::open(&adapter);
     let sample = budget.memory.as_ref().and_then(VideoMemory::sample);
-    let requested =
-        crate::arg_value(crate::perf_log::args(), "--vram-budget").and_then(|v| v.parse().ok());
+    let requested = crate::arg_value(crate::args(), "--vram-budget").and_then(|v| v.parse().ok());
     budget.requested = requested;
     let capacity = sample.as_ref().map_or(0, |s| s.dedicated);
     (budget.bytes, budget.mips) = sample.map_or_else(

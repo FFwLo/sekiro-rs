@@ -181,7 +181,7 @@ pub(crate) fn install(app: &mut App, prefix: &str) {
     app.add_plugins(MaterialPlugin::<FogMaterial>::default())
         .insert_resource(Settings {
             prefix: prefix.to_owned(),
-            enabled: !std::env::args().any(|a| a == "--no-fog-surfaces"),
+            enabled: !crate::args().iter().any(|a| a == "--no-fog-surfaces"),
             empty_gi,
             materials: HashMap::new(),
             definitions: HashMap::new(),

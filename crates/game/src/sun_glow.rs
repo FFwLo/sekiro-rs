@@ -156,7 +156,7 @@ fn configure(
         sky,
     );
     if last.as_ref().is_none_or(|(last, _)| last != &key) {
-        let value = (!std::env::args().any(|a| a == "--no-sun-glow"))
+        let value = (!crate::args().iter().any(|a| a == "--no-sun-glow"))
             .then(|| GameGlow::from_gparam(&lighting.gparam, key.0, key.1, sky))
             .flatten();
         if lighting.fade.is_none() {

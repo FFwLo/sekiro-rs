@@ -416,7 +416,7 @@ fn neighbourhood(cache: &Path) -> Result<BTreeMap<String, Value>> {
 /// Whether `id` plays as the connected world of its neighbouring blocks rather than alone
 /// (`--no-connected-blocks`).
 pub fn connects(id: &str) -> bool {
-    enabled(id) && !std::env::args().any(|a| a == "--no-connected-blocks")
+    enabled(id) && !crate::args().iter().any(|a| a == "--no-connected-blocks")
 }
 
 /// The blocks the play world's collision holds for `id`, with their layouts: the connected
@@ -1110,8 +1110,8 @@ pub(crate) fn spawn(
     }
     let mut spawned = 0;
     let mut capture_roots = BTreeMap::new();
-    let args: Vec<_> = std::env::args().collect();
-    let only_part = crate::arg_value(&args, "--world-part");
+    let args = crate::args();
+    let only_part = crate::arg_value(args, "--world-part");
     // Nearest first across every block, so the stream loads outwards from the start.
     let mut order = Vec::new();
     for (id, block) in &world.blocks {
@@ -1435,7 +1435,7 @@ pub(crate) fn update_detail(
     let Some(camera) = cameras.iter().next() else {
         return;
     };
-    let debug = *debug.get_or_insert_with(|| std::env::args().any(|a| a == "--lod-debug"));
+    let debug = *debug.get_or_insert_with(|| crate::args().iter().any(|a| a == "--lod-debug"));
     let wolf = wolf.iter().next().map(|t| t.translation);
     let groups_off = groups.mode == GroupMode::Off;
     let delta = time.delta_secs();
@@ -1626,7 +1626,7 @@ pub(crate) fn update_detail(
 
 /// One-shot hierarchy audit after loading, for diagnosing scene handoffs at fixed poses.
 pub(crate) fn debug_hierarchy(world: &mut World) {
-    if !std::env::args().any(|a| a == "--world-debug")
+    if !crate::args().iter().any(|a| a == "--world-debug")
         || !world.resource::<Pending>().loaded()
         || world.contains_resource::<HierarchyReported>()
     {

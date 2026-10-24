@@ -1241,9 +1241,9 @@ type PauseScreens<'w> = (
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PauseSystems;
 pub fn install(app: &mut App) {
-    let args: Vec<_> = std::env::args().collect();
+    let args = crate::args();
     crate::game_ui::GameFonts::insert(app);
-    app.insert_resource(PanelState::new(false, &args))
+    app.insert_resource(PanelState::new(false, args))
         .add_systems(Startup, spawn);
     install_input(app);
 }
@@ -1799,7 +1799,7 @@ fn update(
                     }
                 }
                 1 => {
-                    let launch: Vec<String> = std::env::args().skip(1).collect();
+                    let launch: Vec<String> = crate::args().iter().skip(1).cloned().collect();
                     *NEXT.lock().unwrap() = Some(back_to_start(&state, &launch));
                     exit.write(AppExit::Success);
                 }

@@ -422,7 +422,10 @@ fn texture_slots(
 }
 
 pub(super) fn install(app: &mut App, cache: &Path, id: &str, hour: f32) -> Result<()> {
-    if std::env::args().any(|a| a == "--no-sky-dome" || a == "--probe-sky") {
+    if crate::args()
+        .iter()
+        .any(|a| a == "--no-sky-dome" || a == "--probe-sky")
+    {
         return Ok(());
     }
     let dir = cache.join("maps/m89_00_00_99");
@@ -444,7 +447,7 @@ pub(super) fn install(app: &mut App, cache: &Path, id: &str, hour: f32) -> Resul
         horizons: BTreeMap::new(),
         missing: None,
         legacy: legacy_selection(),
-        clock_override: std::env::args().any(|a| a == "--hour"),
+        clock_override: crate::args().iter().any(|a| a == "--hour"),
     };
     let msb = sekiro_formats::msb::parse(&std::fs::read(
         cache.join("raw/map/mapstudio/m89_00_00_99.msb"),

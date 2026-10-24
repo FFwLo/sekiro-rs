@@ -156,8 +156,8 @@ struct TitleRow(usize);
 /// Adds the start menu over the play app built by `crate::play::run_title`, with the
 /// Chapter list of the map in `dir`.
 pub(crate) fn install(app: &mut App, dir: &Path) {
-    let args: Vec<String> = std::env::args().collect();
-    let script = read_script(crate::arg_value(&args, "--title-script").map(PathBuf::from));
+    let args = crate::args();
+    let script = read_script(crate::arg_value(args, "--title-script").map(PathBuf::from));
     GameFonts::insert(app);
     // The app's menus already read it with their atlases (`crate::game_menu::install`).
     MenuArt::add(app, &[TITLE_ATLAS]);

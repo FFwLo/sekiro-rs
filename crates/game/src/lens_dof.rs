@@ -126,7 +126,7 @@ fn configure(
     if unchanged && added.is_empty() {
         return;
     }
-    let value = (!std::env::args().any(|a| a == "--no-dof"))
+    let value = (!crate::args().iter().any(|a| a == "--no-dof"))
         .then(|| GameDof::from_gparam(&lighting.gparam, key.0, key.1))
         .flatten();
     if !unchanged && lighting.fade.is_none() {

@@ -532,7 +532,7 @@ fn load(
         stage("collision world");
         // Wolf's feet meet `h` (#276), built on a thread while the rest loads; `--no-foot-ik`
         // draws them on the play collision, for comparison.
-        let foot_ground = (!std::env::args().any(|a| a == "--no-foot-ik"))
+        let foot_ground = (!crate::args().iter().any(|a| a == "--no-foot-ik"))
             .then(|| crate::foot_ik::FootGround::load(cache, &blocks, &stories, world.clone()));
         let idols = idol::Idols::load(cache, &blocks, |x, z, y| world.floor(x, z, y + 1.0));
         let pickups = pickup::load(cache, &blocks, item_data);
@@ -844,7 +844,7 @@ impl Prepared {
             started: [None, None],
             hit_log: Vec::new(),
             script: self.script,
-            route: ScriptRoute::parse(&std::env::args().collect::<Vec<_>>())?,
+            route: ScriptRoute::parse(crate::args())?,
             step: 0,
             lock_requested: options.lock_on && (options.enemy_present || options.map_enemies),
             break_posture: options.break_posture,
@@ -1329,7 +1329,7 @@ fn build(
     #[cfg(feature = "profile-spans")]
     app.add_systems(Last, crate::span_profile::report);
     if let Some(check) = live_check::LiveCheck::from_args(
-        &std::env::args().collect::<Vec<_>>(),
+        crate::args(),
         map_dir.as_ref().map(|(dir, _)| dir.as_path()),
     )? {
         app.insert_resource(check).add_systems(
@@ -2505,7 +2505,7 @@ fn follow_camera(
     }
     let wolf = shown(&sim, WOLF, fixed.overstep_fraction()).0;
     // Scripted inspection angle: `--extra hang-view`, parsed here to avoid main.rs.
-    if std::env::args().any(|a| a == "hang-view")
+    if crate::args().iter().any(|a| a == "hang-view")
         && let Some(target) = &sim.duel.player.docking.active
     {
         orbit.yaw = target.yaw() - 30.0f32.to_radians();
@@ -2871,7 +2871,8 @@ impl ScriptRoute {
 fn log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("PLAY_LOG_CAMERA").is_some() || std::env::args().any(|a| a == "--input")
+        std::env::var_os("PLAY_LOG_CAMERA").is_some()
+            || crate::args().iter().any(|a| a == "--input")
     })
 }
 

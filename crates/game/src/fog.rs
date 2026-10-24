@@ -1078,7 +1078,7 @@ fn configure(
         );
     }
     let direction = banks.direction(&lighting.gparam, &lighting.source, key.0, key.1);
-    let value = (!std::env::args().any(|a| a == "--no-fog"))
+    let value = (!crate::args().iter().any(|a| a == "--no-fog"))
         .then(|| GameFog::from_gparam(&lighting.gparam, key.0, key.1, direction))
         .flatten();
     if settled {

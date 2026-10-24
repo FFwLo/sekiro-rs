@@ -10,13 +10,13 @@ use bevy::window::{PresentMode, RawHandleWrapper};
 
 pub(crate) fn requested_mode() -> PresentMode {
     mode(
-        std::env::args().any(|a| a == "--uncapped"),
+        crate::args().iter().any(|a| a == "--uncapped"),
         PresentMode::default(),
     )
 }
 
 pub(crate) fn mode(uncapped: bool, default_mode: PresentMode) -> PresentMode {
-    match crate::arg_value(&std::env::args().collect::<Vec<_>>(), "--present-mode").as_deref() {
+    match crate::arg_value(crate::args(), "--present-mode").as_deref() {
         Some("mailbox") => PresentMode::Mailbox,
         Some("immediate") => PresentMode::Immediate,
         Some("fifo") => PresentMode::Fifo,
@@ -32,7 +32,7 @@ struct SurfaceInstance(RenderInstance);
 
 impl Plugin for PresentationPlugin {
     fn build(&self, app: &mut App) {
-        if std::env::args().any(|a| a == "--uncapped") {
+        if crate::args().iter().any(|a| a == "--uncapped") {
             app.insert_resource(bevy::winit::WinitSettings::continuous());
         }
         app.add_systems(Last, (configure_mode, frame_times));

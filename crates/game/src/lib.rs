@@ -26,6 +26,10 @@
 //! `--no-fxr` disables authored FXR playback and keeps the existing effect stand-ins.
 //! `--no-cloth` disables the Havok cloth simulation (characters keep their rigid skin).
 //! `--fxr-preview <id>` repeats an installed effect between the actors every two seconds.
+//!
+//! As a library (`sekiro_rs`), `map` loads an area into another app's Bevy `App`. The flags
+//! above come from the command line [`run`] starts with, or from [`set_args`] in a host; the
+//! library never reads a host's own command line.
 
 mod arena;
 mod arena_b;
@@ -85,6 +89,27 @@ impl BrainOptions {
     }
 }
 
+/// The command line the library reads its flags from (`--story`, `--no-connected-blocks`, the
+/// debug switches): the process's own once [`run`] starts, else the flags a host gave
+/// [`set_args`], else none.
+static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Gives the library flags of ours (`["--story", "genichiro-defeated"]`) for a host that loads
+/// maps without [`run`]. The library never reads the host's own command line, so the host's
+/// flags are not taken for ours; with no call, every flag reads as absent. Call it before
+/// building the app; the first call wins, and false means the flags were already set.
+pub fn set_args<S: Into<String>>(flags: impl IntoIterator<Item = S>) -> bool {
+    let args = std::iter::once("sekiro-rs".to_string())
+        .chain(flags.into_iter().map(Into::into))
+        .collect();
+    ARGS.set(args).is_ok()
+}
+
+/// The command line from [`run`] or [`set_args`], program name first; empty when neither ran.
+fn args() -> &'static [String] {
+    ARGS.get().map_or(&[], Vec::as_slice)
+}
+
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
 }
@@ -103,7 +128,7 @@ fn arg_f32(args: &[String], name: &str, default: f32) -> anyhow::Result<f32> {
 }
 
 fn dispatch() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args = args().to_vec();
     vram::validate_args(&args)?;
     let cache = arg_value(&args, "--cache").map(PathBuf::from);
     if args.iter().any(|a| a == "--cache")
@@ -477,6 +502,7 @@ fn since_start() -> f32 {
 
 pub fn run() -> anyhow::Result<()> {
     process_start();
+    let _ = ARGS.set(std::env::args().collect());
     dispatch()?;
     menu::relaunch()?;
     Ok(())

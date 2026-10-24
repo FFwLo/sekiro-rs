@@ -10,7 +10,7 @@ pub(super) struct RopeLibrary(AnimLibrary);
 pub(super) struct RopeCache(pub PathBuf);
 
 pub(super) fn spawn(commands: &mut Commands, assets: &AssetServer, cache: &Path, prefix: &str) {
-    if !std::env::args().any(|a| a == "skinned-rope") {
+    if !crate::args().iter().any(|a| a == "skinned-rope") {
         return;
     }
     let Ok(mut lib) = AnimLibrary::load(cache, "wp_a_9500") else {
@@ -89,7 +89,7 @@ pub(super) fn draw(
     }
     // The native model's attachment/chain deformation is not traced yet.
     // Keep its export and opt-in preview, but use the endpoint-correct line in play.
-    if !std::env::args().any(|a| a == "skinned-rope") {
+    if !crate::args().iter().any(|a| a == "skinned-rope") {
         for (_, _, mut vis) in &mut ropes {
             *vis = Visibility::Hidden;
         }

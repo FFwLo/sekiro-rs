@@ -161,7 +161,7 @@ pub struct FxrPlayer {
 
 impl FxrPlayer {
     pub(crate) fn new(cache: PathBuf) -> Self {
-        let enabled = !std::env::args().any(|a| a == "--no-fxr");
+        let enabled = !crate::args().iter().any(|a| a == "--no-fxr");
         let lib = if enabled {
             FxrLib::scan(&cache)
         } else {
@@ -202,8 +202,7 @@ impl FxrPlayer {
             particles: 0,
             spawned: 0,
             rejected: 0,
-            preview: std::env::args()
-                .collect::<Vec<_>>()
+            preview: crate::args()
                 .windows(2)
                 .find(|a| a[0] == "--fxr-preview")
                 .and_then(|a| a[1].parse().ok()),

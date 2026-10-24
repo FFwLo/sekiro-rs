@@ -509,10 +509,10 @@ fn write_visibility(
     let _timer = crate::perf_log::SystemTimer::start("write_visibility");
     static DEBUG: std::sync::OnceLock<(bool, Option<String>)> = std::sync::OnceLock::new();
     let (debug, debug_part) = DEBUG.get_or_init(|| {
-        let args: Vec<_> = std::env::args().collect();
+        let args = crate::args();
         (
             args.iter().any(|a| a == "--visibility-debug"),
-            crate::arg_value(&args, "--visibility-part"),
+            crate::arg_value(args, "--visibility-part"),
         )
     });
     for (entity, part, mut visibility, previous) in &mut parts {
