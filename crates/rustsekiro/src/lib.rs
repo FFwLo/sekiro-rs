@@ -47,14 +47,14 @@ mod enemy_bullet;
 mod experience;
 mod ffx;
 mod fxr;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod fog_wall;
 #[cfg(feature = "embed")]
 mod fonts;
 mod form;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod height_fog;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod sky;
 #[cfg(feature = "embed")]
 mod fmod;
@@ -67,12 +67,12 @@ mod idol_found;
 mod items;
 mod gore;
 mod guard;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod grading;
 mod hks;
 mod hks_enemy;
 mod hks_wolf;
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod hks_lua;
 mod hkb_runtime;
 #[cfg(feature = "embed")]
@@ -80,22 +80,22 @@ mod hud;
 #[cfg(feature = "host")]
 mod icon;
 mod interp;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod map;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod map_fx;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod map_grass;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod map_lights;
 #[cfg(feature = "embed")]
 mod menu;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod sandbox;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod sculptor;
 mod seat;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod showcase;
 #[cfg(any(feature = "host", feature = "embed"))]
 mod shot;
@@ -108,41 +108,91 @@ mod perf;
 #[cfg(feature = "embed")]
 mod pickups;
 mod place;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod photo;
 mod ninjutsu;
 mod player;
 mod prosthetic;
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod shader_tests;
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod sim_tests;
 #[cfg(feature = "embed")]
 mod sound;
 mod sound_rules;
 #[cfg(feature = "host")]
 mod sr_map;
+/// Without `host` (the tests in sekiro-rs's repo) there is no sekiro-rs map: map.rs's questions
+/// to it answer "own map", as sr_map.rs does in the host tests (`SHINOBI_SR_MAP` unset).
+#[cfg(all(test, not(feature = "host")))]
+mod sr_map {
+    use crate::config::GameConfig;
+
+    pub const DEFAULT_START: (&str, i64) = ("m11_01_00_00", 1_111_950);
+
+    pub fn active() -> bool {
+        false
+    }
+
+    pub fn world() -> bool {
+        false
+    }
+
+    pub fn default_start(_config: &GameConfig) -> bool {
+        false
+    }
+
+    pub fn switch_relaunches(_arena: &str) -> bool {
+        false
+    }
+
+    pub fn relaunch(map: &str, _chr: &str, _npc_row: Option<i64>) -> ! {
+        unreachable!("no sekiro-rs map to relaunch on {map}")
+    }
+
+    pub fn fight_env() -> Option<(String, Option<i64>)> {
+        let v = std::env::var("SHINOBI_FIGHT").ok()?;
+        let mut it = v.split(':');
+        Some((it.next()?.to_string(), it.next().and_then(|r| r.parse().ok())))
+    }
+
+    pub fn idol_start() -> Option<i64> {
+        std::env::var("SHINOBI_IDOL").ok().and_then(|v| v.parse().ok())
+    }
+
+    pub fn blocks() -> Vec<String> {
+        Vec::new()
+    }
+
+    pub fn edges() -> Option<(Vec<crate::traversal::GrapplePoint>, Vec<crate::traversal::LedgeEdge>)> {
+        None
+    }
+
+    pub fn collision() -> Option<std::sync::Arc<dyn crate::terrain::WorldCollision>> {
+        None
+    }
+}
 mod status;
 mod stealth;
 mod swim;
 mod terrain;
 mod traversal;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod throw_trace;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod trace;
 #[cfg(feature = "embed")]
 mod ui_stage;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod ufo;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod autoboss;
 mod vfx;
 mod view;
 mod wire;
 #[cfg(feature = "embed")]
 mod workshop;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 mod world;
 
 /// The combat core for another Bevy game: Wolf, the enemies, combat, the game's HKS scripts and

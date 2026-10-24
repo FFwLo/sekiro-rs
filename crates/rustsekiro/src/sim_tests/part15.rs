@@ -6,6 +6,8 @@ use super::*;
 
 /// sekiro-rs's draw params for `stem` (his cache, `raw/param/drawparam/<stem>.gparam`) as his
 /// MapLighting; None (test skipped) without his cache.
+/// The sekiro-rs tests here need its game crate (`host`).
+#[cfg(feature = "host")]
 fn sr_lighting(stem: &str, light_set: i32, hour: f32) -> Option<sekiro_rs::lighting::MapLighting> {
     let path = crate::sr_map::cache().join(format!("raw/param/drawparam/{stem}.gparam"));
     let gparam = sekiro_formats::gparam::parse(&std::fs::read(&path).ok()?).ok()?;
@@ -17,6 +19,7 @@ fn sr_lighting(stem: &str, light_set: i32, hour: f32) -> Option<sekiro_rs::light
 /// DiffColor0 as the exe uploads it (rgb * rgb * W), the same as our own reader of the same
 /// gparam gives, and the scene unit is his exe-traced bridge (pi / Bevy's default exposure).
 #[test]
+#[cfg(feature = "host")]
 fn atlas_lightset_fields_lit_particles_take_sekiro_rs_light_set() {
     assert!((crate::map::SCENE_TO_BEVY - 3135.61).abs() < 0.01, "the bridge is sekiro-rs's");
     let Ok(text) = std::fs::read_to_string(crate::paths::extracted().join("map_m11_01_00_00.json")) else {
@@ -102,6 +105,7 @@ fn atlas_hit_effects_come_from_the_tables_and_the_games_own_fxr() {
 }
 
 /// Our side's map lighting for the hour / light set tests (no draw params needed).
+#[cfg(feature = "host")]
 fn our_lighting(light_set: i32, hour: f32) -> crate::map::MapLighting {
     crate::map::MapLighting {
         drawparam: serde_json::Value::Null,
@@ -124,6 +128,7 @@ fn our_lighting(light_set: i32, hour: f32) -> crate::map::MapLighting {
 /// visuals.lightset-per-collision on our own scene (the sandbox): his light set is the one our
 /// export took from the collision under the source arena's fight spot.
 #[test]
+#[cfg(feature = "host")]
 fn atlas_time_of_day_and_scene_light_set_reach_sekiro_rs_lighting() {
     let Some(his) = sr_lighting("m11_01_0000", 0, 0.0) else {
         eprintln!("no sekiro-rs cache: skipped");

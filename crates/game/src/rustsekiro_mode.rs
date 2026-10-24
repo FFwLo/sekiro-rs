@@ -36,16 +36,24 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Where this fork starts with no arguments: the Ashina Castle idol.
 const DEFAULT_START: [&str; 4] = ["--map", "m11_01_00_00", "--at-idol", "1111950"];
 
-/// This fork plays RustSekiro's Wolf only. Fills in `--rustsekiro <dir>` for a map
-/// ([`default_dir`]) and [`DEFAULT_START`] when there are no arguments; refuses the modes that
-/// play sekiro-rs's own Wolf (`--play`, `--arena`, the start menu).
+/// This fork plays RustSekiro's Wolf only. `--play` starts it too: on `--map` / `--at-idol` when
+/// given (an idol alone names its map), else at [`DEFAULT_START`], as no arguments do. Fills in
+/// `--rustsekiro <dir>` for a map ([`default_dir`]); refuses the modes that have no map for it
+/// (`--arena`, the start menu).
 pub fn own_wolf_args(mut args: Vec<String>) -> Result<Vec<String>> {
+    let play = args.iter().position(|a| a == "--play").map(|i| args.remove(i)).is_some();
+    if play && crate::arg_value(&args, "--map").is_none() {
+        match crate::arg_value(&args, "--at-idol").and_then(|e| e.parse::<i64>().ok()) {
+            Some(entity) => args.extend(["--map".into(), idol_map(entity)]),
+            None => args.extend(DEFAULT_START.map(String::from)),
+        }
+    }
     if args.len() == 1 {
         args.extend(DEFAULT_START.map(String::from));
     }
     anyhow::ensure!(
-        !args.iter().any(|a| matches!(a.as_str(), "--play" | "--arena" | "--menu")),
-        "this build plays RustSekiro's Wolf only: start it with --map <id> --at-idol <entity> (or no arguments), not --play, --arena or --menu"
+        !args.iter().any(|a| matches!(a.as_str(), "--arena" | "--menu")),
+        "this build plays RustSekiro's Wolf only: start it with --play, --map <id> --at-idol <entity> or no arguments, not --arena or --menu"
     );
     if crate::arg_value(&args, "--map").is_some() && crate::arg_value(&args, "--rustsekiro").is_none() {
         let dir = default_dir().ok_or_else(|| anyhow!("no RustSekiro folder found: pass --rustsekiro <dir> or set RUSTSEKIRO_DIR"))?;
@@ -60,7 +68,9 @@ fn default_dir() -> Option<PathBuf> {
     std::env::var_os("RUSTSEKIRO_DIR")
         .map(PathBuf::from)
         .into_iter()
-        .chain(["../fireguy-rustsekiro", "../RustSekiro"].map(PathBuf::from))
+        // This repo's copy (crates/rustsekiro, with its extracted/ data), then a RustSekiro
+        // checkout next to it.
+        .chain(["crates/rustsekiro", "../fireguy-rustsekiro", "../RustSekiro"].map(PathBuf::from))
         .find(|d| d.join("extracted").is_dir())
         // Absolute: the asset server reads RustSekiro's HUD art from the exe's folder otherwise.
         .and_then(|d| std::path::absolute(d).ok())
@@ -131,9 +141,14 @@ fn idol_spot(entity: i64) -> Option<(Vec3, Vec3)> {
 }
 
 /// Travel to an idol of another map: this exe again on that map at the idol; this run ends.
+/// The map an idol entity stands on: its block in the entity id (1101956 is m11_00).
+fn idol_map(entity: i64) -> String {
+    format!("m{:02}_{:02}_00_00", entity / 100_000, (entity / 10_000) % 10)
+}
+
 fn travel(entity: i64) {
     // Bonfire entity AABCCCC: map mAA_BB_00_00.
-    let map = format!("m{:02}_{:02}_00_00", entity / 100_000, (entity / 10_000) % 10);
+    let map = idol_map(entity);
     let dir = DIR.get().cloned().unwrap_or_default();
     info!("rustsekiro: travel to idol {entity} on {map}");
     let args = travel_args(&std::env::args().collect::<Vec<_>>(), &map, entity, &dir);
@@ -666,6 +681,21 @@ mod tests {
         // A part with no row keeps its block and the plain reverb.
         assert!(place_on(&mut place, &("m11_00_00_00".into(), "h999999".into()), &spaces));
         assert_eq!((place.source_map.as_str(), place.sound_space), ("m11_00_00_00", 0));
+    }
+
+    /// `--play` starts this Wolf: at the default idol, on a given map, or on an idol's own map.
+    #[test]
+    fn play_starts_this_wolf() {
+        let args = |a: &[&str]| own_wolf_args(["exe"].iter().chain(a).map(|s| s.to_string()).collect()).unwrap();
+        let play = args(&["--play", "--rustsekiro", "R"]);
+        assert!(!play.iter().any(|a| a == "--play"), "{play:?}");
+        assert_eq!(crate::arg_value(&play, "--map").as_deref(), Some(DEFAULT_START[1]));
+        assert_eq!(crate::arg_value(&play, "--at-idol").as_deref(), Some(DEFAULT_START[3]));
+        let idol = args(&["--play", "--at-idol", "1101956", "--rustsekiro", "R"]);
+        assert_eq!(crate::arg_value(&idol, "--map").as_deref(), Some("m11_00_00_00"));
+        let map = args(&["--play", "--map", "m20_00_00_00", "--at-idol", "2001950", "--rustsekiro", "R"]);
+        assert_eq!(crate::arg_value(&map, "--map").as_deref(), Some("m20_00_00_00"));
+        assert!(own_wolf_args(["exe", "--arena", "x"].map(String::from).to_vec()).is_err());
     }
 
     /// A Travel keeps the run's cache and options and replaces only its start.

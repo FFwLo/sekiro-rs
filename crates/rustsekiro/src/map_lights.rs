@@ -85,7 +85,7 @@ fn place(mut commands: Commands, lighting: Res<MapLighting>, old: Query<Entity, 
     }
     let Some(origin) = lighting.map_origin else { return };
     let lights = arena_lights(&lighting.source_map, origin, lighting.arena_yaw);
-    let lumens = sekiro_rs::lighting::LOCAL_LUMENS_PER_UNIT;
+    let lumens = crate::map::LOCAL_LUMENS_PER_UNIT;
     for l in &lights {
         let mut e = commands.spawn((MapLight, crate::map::MapPiece, Name::new("map light")));
         match l.spot {

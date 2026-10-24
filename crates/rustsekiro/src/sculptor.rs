@@ -240,6 +240,8 @@ mod tests {
         });
     }
 
+    // The Sculptor's seat is one of Wolf's interactions only with `host` (idol.rs world_hooks).
+    #[cfg(feature = "host")]
     #[test]
     fn the_player_simulation_finishes_sitting_before_opening_the_workshop() {
         let mut app = crate::sim_tests::app();

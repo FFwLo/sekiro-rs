@@ -42,10 +42,23 @@ use crate::place::{frame, json_frame, loaded_map, on_boss_arena, Frame};
 /// white surface under `Col * N.L = 1` has native radiance 1; Bevy's diffuse is
 /// `albedo / pi * lux * exposure`, so lux = pi / exposure at Bevy's default camera exposure.
 /// Before, the older fitted 4500 (1.435x too bright against it).
+#[cfg(feature = "host")]
 pub const SCENE_TO_BEVY: f32 = sekiro_rs::lighting::SCENE_TO_BEVY;
+// Without `host` (no sekiro-rs library) the same values, from sekiro-rs's
+// crates/game/src/lighting.rs.
+#[cfg(not(feature = "host"))]
+pub const SCENE_TO_BEVY: f32 = 3_135.61;
 const LUX_PER_UNIT: f32 = SCENE_TO_BEVY;
 /// cd/m^2 per unit of hemisphere / probe radiance: the same scale seen as radiance (/ pi).
+#[cfg(feature = "host")]
 pub(crate) const ENV_PER_UNIT: f32 = sekiro_rs::lighting::ENV_PER_UNIT;
+#[cfg(not(feature = "host"))]
+pub(crate) const ENV_PER_UNIT: f32 = SCENE_TO_BEVY / std::f32::consts::PI;
+/// Bevy lumens per native local-light unit (sekiro-rs lighting.rs `LOCAL_LUMENS_PER_UNIT`).
+#[cfg(feature = "host")]
+pub(crate) const LOCAL_LUMENS_PER_UNIT: f32 = sekiro_rs::lighting::LOCAL_LUMENS_PER_UNIT;
+#[cfg(not(feature = "host"))]
+pub(crate) const LOCAL_LUMENS_PER_UNIT: f32 = SCENE_TO_BEVY * 4.0 * std::f32::consts::PI;
 const AMBIENT_PER_UNIT: f32 = ENV_PER_UNIT;
 /// Auto exposure (`auto_exposure`): the game's log2 luminance units onto this renderer's
 /// buffer, and the EV base that keeps the 18 h look (-Exposure at 18 h).
@@ -2175,10 +2188,11 @@ impl MaterialCache {
 fn publish_scene_light(
     mut commands: Commands,
     map_light: Option<Res<MapLighting>>,
-    sr_light: Option<Res<sekiro_rs::lighting::MapLighting>>,
+    #[cfg(feature = "host")] sr_light: Option<Res<sekiro_rs::lighting::MapLighting>>,
     now: Option<Res<crate::fxr::SceneLight>>,
-    mut sr_cached: Local<Option<((i32, u32), (Vec3, Vec3, Vec3))>>,
+    #[cfg(feature = "host")] mut sr_cached: Local<Option<((i32, u32), (Vec3, Vec3, Vec3))>>,
 ) {
+    #[cfg(feature = "host")]
     let sr = sr_light.map(|l| {
         let key = (l.light_set, l.hour.to_bits());
         match *sr_cached {
@@ -2190,8 +2204,10 @@ fn publish_scene_light(
             }
         }
     });
+    #[cfg(not(feature = "host"))]
+    let sr: Option<(Vec3, Vec3, Vec3)> = None;
     let Some((amb, sun, to_sun)) = sr.or_else(|| map_light.as_deref().map(particle_light)) else { return };
-    let light = crate::fxr::SceneLight { ambient: amb * ENV_PER_UNIT, sun: sun * ENV_PER_UNIT, to_sun, lumens_per_unit: sekiro_rs::lighting::LOCAL_LUMENS_PER_UNIT };
+    let light = crate::fxr::SceneLight { ambient: amb * ENV_PER_UNIT, sun: sun * ENV_PER_UNIT, to_sun, lumens_per_unit: LOCAL_LUMENS_PER_UNIT };
     if now.as_deref() != Some(&light) {
         commands.insert_resource(light);
     }
