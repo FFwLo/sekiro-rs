@@ -1,0 +1,924 @@
+//! The ground the fight stands on: the hit collision (floors, walls, a ray), filled by the host's
+//! map (this game's map.rs from its own `.hit` export or sekiro-rs's play world, sr_map.rs) and
+//! asked by Wolf, the enemies, bullets and effects. Floors are walkable within the slope limit
+//! and stepped onto within STEP_HEIGHT; walls push three stacked spheres out horizontally, so
+//! bodies stop and slide. Ported from sekiro-rs `crates/sim/src/collision.rs`. Every triangle
+//! carries its HitMtrlParam id (footsteps, fall death). Without one the floor is flat at y = 0.
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
+use bevy::prelude::*;
+
+use crate::actor::{Actor, Side};
+use crate::player::CAPSULE_HALF_HEIGHT;
+
+/// Body radius for wall contacts: Wolf's map-hit capsule, 1.5 m high, radius 0.4 (exe
+/// FUN_140bc3140, hard-coded for the player; NPCs read NpcParam hitHeight / hitRadius in
+/// FUN_140bc2e00). Live physics module +0xD0 = 1.5 / 0.4 agrees.
+pub const RADIUS: f32 = 0.4;
+/// Highest ledge a walking body steps onto (Wolf follows the floor down by
+/// player::FALL_START_DROP). gap: the character proxy's step-up is not traced (Havok sweep, no explicit value found).
+pub const STEP_HEIGHT: f32 = 0.5;
+/// hknpCharacterProxyCinfo maxSlope, set to 60 deg in FUN_14104d3d0 (0x3f860a92 = 1.0472 rad).
+const MAX_SLOPE_DEGREES: f32 = 60.0;
+/// Heights of the contact spheres' centres above the feet; the lowest sphere's bottom sits at
+/// the step height so stairs reach the floor query rather than the wall push.
+const SPHERES: [f32; 3] = [STEP_HEIGHT + RADIUS, 1.2, 1.55];
+const CELL: f32 = 4.0;
+
+/// A whole play world's collision the host brings (sekiro-rs's `CollisionWorld`, sr_map.rs):
+/// answers the floor, ray and wall queries in place of the terrain's own triangles.
+pub trait WorldCollision: Send + Sync {
+    /// The highest walkable surface under (x, z) no higher than `top`: (height, triangle).
+    fn floor_hit(&self, x: f32, z: f32, top: f32) -> Option<(f32, u32)>;
+    /// HitMtrlParam id of that surface.
+    fn floor_material(&self, x: f32, z: f32, top: f32) -> Option<u32>;
+    fn raycast(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32>;
+    /// A body at `feet` moved by the horizontal `delta`, stopped and slid by walls: the move made.
+    fn slide(&self, feet: [f32; 3], delta: [f32; 2]) -> [f32; 2];
+    fn triangle_count(&self) -> usize;
+    /// The highest water plane under (x, z) no higher than `top`: (height, HitMtrlParam id).
+    fn water_surface(&self, _x: f32, _z: f32, _top: f32) -> Option<(f32, u32)> {
+        None
+    }
+    /// Whether a body's feet moving `from` -> `to` pass through an event wall that starts the
+    /// fall return (the map's hit filter 15 collision over drops into the void).
+    fn fall_return_wall(&self, _from: Vec3, _to: Vec3) -> bool {
+        false
+    }
+    /// [`WorldCollision::slide`] that also keeps to the fall-prevention walls `protect` asks for
+    /// (Actor::fall_protect bits).
+    fn slide_protected(&self, feet: [f32; 3], delta: [f32; 2], _protect: u8) -> [f32; 2] {
+        self.slide(feet, delta)
+    }
+    /// The camera's ray: the world's camera collision (its own hit filters: camera-only walls,
+    /// no player-only ones), else the body's.
+    fn camera_raycast(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+        self.raycast(origin, dir, max)
+    }
+    /// The ground foot IK casts onto (anim.rs `foot_ik`): the game casts the feet on the detailed
+    /// `h` collision while the body stands on the flat `l` one. The floor by default.
+    fn foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        self.floor_hit(x, z, top).map(|(h, _)| h)
+    }
+    /// The highest the feet of a body at `feet` can rise straight up, by at most `rise`, before
+    /// its head meets a ceiling (`None`: nothing stops it that soon). No ceilings by default.
+    fn ceiling(&self, _feet: [f32; 3], _rise: f32) -> Option<f32> {
+        None
+    }
+    /// The floor as the enemies stand on it: the world's enemy collision (enemy-only floors and
+    /// water surfaces), else the body's.
+    fn enemy_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        self.floor_hit(x, z, top).map(|h| h.0)
+    }
+    /// The ground an enemy's foot IK casts onto: [`WorldCollision::foot_floor`]'s detailed ground
+    /// where the world keeps it (around Wolf; an enemy's feet never move where that is kept),
+    /// else the enemy floor.
+    fn enemy_foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        self.enemy_floor(x, z, top)
+    }
+    /// A slide as the enemies take it: stopped by the enemy-only walls too (the ones that keep
+    /// them off cliffs and in their areas), else the body's.
+    fn enemy_slide(&self, feet: [f32; 3], delta: [f32; 2]) -> [f32; 2] {
+        self.slide(feet, delta)
+    }
+    /// [`WorldCollision::enemy_slide`] for a body `radius` wide and `height` tall: an NPC's map
+    /// proxy is its NpcParam hitRadius / hitHeight (the exe's FUN_140bc2e00 -> FUN_140bc1b20,
+    /// row +0x14 / +0x10), not Wolf's 0.4 by 1.5. Wolf's size by default.
+    fn enemy_slide_sized(&self, feet: [f32; 3], delta: [f32; 2], _radius: f32, _height: f32) -> [f32; 2] {
+        self.enemy_slide(feet, delta)
+    }
+}
+
+/// HitMtrlParam's water planes (Paramdex names): 20 puddle, 21 walkable, 22 dive, 23 / 24 poison
+/// swamp, 35 walkable slope, 36 swim slope, 37 / 38 water and grass (walkable / swimming).
+pub const fn water_material(m: u32) -> bool {
+    matches!(m, 20..=24 | 35..=38)
+}
+
+/// The deep ones (22 / 36 / 38: fallDeathDist 80, fallDamageRate 0.5): a surface Wolf swims in,
+/// never a floor. gap: the exe's swim trigger is not traced (the native BEH_R_STAND_MOVE_TO_SWIM
+/// request); these rows by their names and fall values.
+pub const fn deep_water(m: u32) -> bool {
+    matches!(m, 22 | 36 | 38)
+}
+
+/// The highest water plane under (x, z) no higher than `top` (height, material), from the map's
+/// own hit triangles or the host's world.
+pub fn water_surface(x: f32, z: f32, top: f32) -> Option<(f32, u32)> {
+    terrain()?.water(x, z, top)
+}
+
+/// The hit collision, shared with the systems that cannot take a resource (player.rs floor
+/// checks, the host's camera arm clamp and floor sounds) through [`terrain`].
+pub struct Terrain {
+    pub(crate) verts: Vec<Vec3>,
+    pub(crate) tris: Vec<[u32; 3]>,
+    pub(crate) normals: Vec<Vec3>,
+    pub(crate) materials: Vec<u32>,
+    pub(crate) cells: HashMap<(i32, i32), Vec<u32>>,
+    pub(crate) min_walk_ny: f32,
+    /// Level triangles without a hit material dropped at load (see `from_tris`).
+    pub(crate) helper_planes: usize,
+    /// Under sekiro-rs's map: its whole play world's collision (sr_map.rs `collision`), which
+    /// answers the floor, ray and wall queries in place of the triangles above (left empty).
+    world: Option<Arc<dyn WorldCollision>>,
+}
+
+static TERRAIN: OnceLock<RwLock<Option<Arc<Terrain>>>> = OnceLock::new();
+
+/// The fog-wall collision in force: the terrain it belongs to (held, so its address stays
+/// unique) and the gates standing on it (the host's map: map.rs `set_gates`).
+static GATES_ON: OnceLock<RwLock<(Option<Arc<Terrain>>, Vec<Arc<Terrain>>)>> = OnceLock::new();
+
+/// Switches the fog-wall collision on: `on` stands on `base` while their fight is on (an empty
+/// `on` / no `base`: none).
+pub(crate) fn set_gates_on(base: Option<Arc<Terrain>>, on: Vec<Arc<Terrain>>) {
+    *GATES_ON.get_or_init(Default::default).write().unwrap() = (base, on);
+}
+
+pub fn terrain() -> Option<Arc<Terrain>> {
+    TERRAIN.get_or_init(|| RwLock::new(None)).read().ok()?.clone()
+}
+
+/// Floor height under an actor centre (its feet are CAPSULE_HALF_HEIGHT lower): the highest
+/// walkable surface at most STEP_HEIGHT above the feet, else the one below; 0 without a map.
+/// How far from the centre the capsule's rim rests on a ledge (sekiro-rs sim body.rs
+/// RIM_SUPPORT: the radius x 0.866).
+const RIM_SUPPORT: f32 = RADIUS * 0.866;
+
+/// The floor Wolf's capsule rim still rests on when the floor under his centre has dropped away
+/// (sim body.rs `rim_support`): the highest under eight points round the feet that is no higher
+/// than them and within the walk-down (`FALL_START_DROP`); he stands on a ledge's edge as the
+/// game's capsule does, instead of dropping once his centre is past it.
+pub fn rim_floor(centre: Vec3) -> Option<f32> {
+    let t = terrain()?;
+    let feet = centre.y - CAPSULE_HALF_HEIGHT;
+    (0..8)
+        .filter_map(|i| {
+            let (s, c) = (i as f32 * std::f32::consts::FRAC_PI_4).sin_cos();
+            t.floor(centre.x + RIM_SUPPORT * c, centre.z + RIM_SUPPORT * s, feet + 0.05)
+        })
+        .filter(|h| feet - h < crate::player::FALL_START_DROP)
+        .reduce(f32::max)
+}
+
+pub fn ground_y(centre: Vec3) -> f32 {
+    let Some(t) = terrain() else { return 0.0 };
+    let feet = centre.y - CAPSULE_HALF_HEIGHT;
+    t.floor(centre.x, centre.z, feet + STEP_HEIGHT).or_else(|| t.floor(centre.x, centre.z, f32::INFINITY)).unwrap_or(feet - 100.0)
+}
+
+/// An enemy falling: the feet's height when it left the ground.
+#[derive(Component)]
+pub struct EnemyFall {
+    top: f32,
+}
+
+/// Enemies fall off ledges as Wolf does (knocked, pushed or walked off a drop deeper than
+/// FALL_START_DROP that `bodies_on_terrain` left them over): gravity as fall type 0, landing on
+/// the enemy floor ([`Terrain::landing`]'s look-up), and death on landing from fallDeathDist of
+/// the ground's HitMtrlParam row or more ([`fall_death_dist`], the exe's kill test for every
+/// character). Before, they were put on the floor below in one tick, however far down.
+pub(crate) fn enemy_falls(
+    combat: Res<crate::data::Combat>,
+    time: Res<Time>,
+    mut commands: Commands,
+    mut q: Query<(Entity, &mut Actor, &mut Transform, &mut crate::enemy::Enemy, Option<&EnemyFall>)>,
+) {
+    let Some(t) = terrain() else { return };
+    let dt = time.delta_secs();
+    for (e, mut a, mut tf, mut enemy, fall) in &mut q {
+        let feet = tf.translation.y - CAPSULE_HALF_HEIGHT;
+        let lifted = !a.anim.is_empty() && crate::actor::data_for(&combat, &a).flag(&a.anim, a.t, crate::player::FLAG_NO_GRAVITY);
+        let Some(fall) = fall else {
+            if !a.lod_due || a.airborne || lifted || a.lift_ground.is_some() || enemy.is_dead() {
+                continue;
+            }
+            let (x, z) = (tf.translation.x, tf.translation.z);
+            let held = t.enemy_floor(x, z, feet + STEP_HEIGHT).is_some_and(|h| h >= feet - crate::player::FALL_START_DROP) || rim_floor(tf.translation).is_some();
+            if !held {
+                commands.entity(e).insert(EnemyFall { top: feet });
+                a.airborne = true;
+                a.vel_y = 0.0;
+                a.grav_y = crate::data::FALL_TYPES[0].gravity();
+            }
+            continue;
+        };
+        if lifted {
+            continue;
+        }
+        a.vel_y += a.grav_y * dt;
+        let fell = (-a.vel_y * dt).max(0.0);
+        let floor = t.enemy_floor(tf.translation.x, tf.translation.z, feet + STEP_HEIGHT.max(fell + 0.05));
+        match floor.filter(|h| feet <= *h) {
+            Some(h) => {
+                tf.translation.y = h + CAPSULE_HALF_HEIGHT;
+                a.airborne = false;
+                a.vel_y = 0.0;
+                commands.entity(e).remove::<EnemyFall>();
+                let deadly = fall_death_dist(floor_material(tf.translation)).is_some_and(|dist| fall.top - h >= dist);
+                if deadly && !enemy.is_dead() && enemy.dies_at_zero_hp(&a, &combat) {
+                    a.hp = 0.0;
+                    enemy.die_at_zero_hp(&mut a, &combat);
+                }
+            }
+            // Into the void, far past any floor: dead where it is.
+            None if fall.top - feet > 200.0 => {
+                commands.entity(e).remove::<EnemyFall>();
+                a.airborne = false;
+                a.vel_y = 0.0;
+                if !enemy.is_dead() && enemy.dies_at_zero_hp(&a, &combat) {
+                    a.hp = 0.0;
+                    enemy.die_at_zero_hp(&mut a, &combat);
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// The floor a falling body lands on: the highest one no higher than its feet plus what it fell
+/// in a tick (`fell`, at least STEP_HEIGHT). A fast fall (30 m/s is 0.5 m a tick) no longer
+/// passes a thin floor between two ticks' checks, and with no floor below there is none: it
+/// keeps falling instead of [`ground_y`]'s snap up onto the highest floor overhead (a bridge
+/// over the void it fell past).
+pub fn landing_y(centre: Vec3, fell: f32) -> f32 {
+    terrain().map_or(0.0, |t| t.landing(centre, fell))
+}
+
+/// Whether an actor centre moving `from` -> `to` passes a fall-return event wall (the host's
+/// world only; the own map has none).
+pub fn fall_return_wall(from: Vec3, to: Vec3) -> bool {
+    let feet = Vec3::Y * CAPSULE_HALF_HEIGHT;
+    terrain().and_then(|t| t.world.clone()).is_some_and(|w| w.fall_return_wall(from - feet, to - feet))
+}
+
+/// HitMtrlParam id of the floor under an actor centre (None without a map or over nothing).
+pub fn floor_material(centre: Vec3) -> Option<u32> {
+    let t = terrain()?;
+    let top = centre.y - CAPSULE_HALF_HEIGHT + STEP_HEIGHT;
+    if let Some(w) = &t.world {
+        return w.floor_material(centre.x, centre.z, top);
+    }
+    t.floor_tri(centre.x, centre.z, top).map(|(_, tri)| t.materials[tri as usize])
+}
+
+/// HitMtrlParam fallDeathDist / disableFallDamage / fallDamageRate per material id
+/// (extracted/json/params).
+fn hit_mtrl_fall() -> &'static HashMap<u32, (f32, bool, f32)> {
+    static T: std::sync::OnceLock<HashMap<u32, (f32, bool, f32)>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let path = crate::paths::extracted().join("json/params/HitMtrlParam.json");
+        let json: serde_json::Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let rows = json["rows"].as_array().cloned().unwrap_or_default();
+        rows.iter().filter_map(|r| Some((r["id"].as_u64()? as u32, (r["fallDeathDist"].as_f64()? as f32, r["disableFallDamage"].as_u64().unwrap_or(0) != 0, r["fallDamageRate"].as_f64().unwrap_or(1.0) as f32)))).collect()
+    })
+}
+
+/// How far (m) Wolf may fall onto this ground before the landing kills him, None where fall
+/// damage is off. Exe: FUN_14084e5d0 (the kill test) is `fall height >= HitMtrlParam +0x4c
+/// (fallDeathDist)`, and only from 20 m up (DAT_143b01948 = 20.0 in the exe's data; 5 m while
+/// SpEffect type 0x155 is worn, DAT_143b01950/54). The row is the material under the landing
+/// (FUN_1408433f0 reads it from the fall module's material id); no ground = the table's default
+/// 40 (gap: the exe's void kill height is not traced). The height is metres (the same 20 as the
+/// long stiff landing, c0000_define 213).
+pub fn fall_death_dist(material: Option<u32>) -> Option<f32> {
+    match material.and_then(|m| hit_mtrl_fall().get(&m)) {
+        Some((_, true, _)) => None,
+        Some((dist, false, _)) => Some(*dist),
+        None => Some(40.0),
+    }
+}
+
+/// The share of max HP a landing that does not kill costs (exe FUN_140843660, landing
+/// FUN_140b97b30: damage = maxHP x this): 0 under `from` (20 m; the caller passes 5 m while
+/// stateInfo 341, aging, is worn: DAT_143b01950/54), else CalcCorrectGraph 210 (the identity
+/// from 20 to 100) x 0.01 x graphs 211 / 212 (a flat 100 %) x HitMtrlParam fallDamageRate (0.5
+/// on the deep-water planes 22 / 36 / 38). 0 on a disableFallDamage floor; the caller zeroes it
+/// under stateInfo 47 (SpEffects 640 / 4050 / 4053, FUN_140ba8cb0). gap: the factors
+/// FUN_1408433f0 feeds the graphs (flat here, so they do not matter) are not decoded.
+pub fn fall_damage_share(h: f32, material: Option<u32>, from: f32) -> f32 {
+    let (off, rate) = match material.and_then(|m| hit_mtrl_fall().get(&m)) {
+        Some((_, off, rate)) => (*off, *rate),
+        None => (false, 1.0),
+    };
+    if off || h < from {
+        return 0.0;
+    }
+    (h.clamp(20.0, 100.0) * 0.01 * rate).min(1.0)
+}
+
+/// Distance along `dir` (unit) to the first collision triangle within `max`.
+pub fn raycast(origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+    terrain()?.raycast(origin, dir, max)
+}
+
+/// The camera arm's ray ([`WorldCollision::camera_raycast`] under the host's world).
+pub fn camera_raycast(origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+    let t = terrain()?;
+    match &t.world {
+        Some(w) => w.camera_raycast(origin, dir, max),
+        None => t.raycast(origin, dir, max),
+    }
+}
+
+/// Where a body whose centre rose from `from_y` to `to.y` this step stops under a ceiling: the
+/// centre height its head meets one at (the host's world only).
+pub fn ceiling_stop(to: Vec3, from_y: f32) -> Option<f32> {
+    terrain()?.ceiling_stop(to, from_y)
+}
+
+fn cell_of(x: f32, z: f32) -> (i32, i32) {
+    ((x / CELL).floor() as i32, (z / CELL).floor() as i32)
+}
+
+impl Terrain {
+    /// Collision from triangles already in Bevy space (`(indices, material)` each): the hit
+    /// files and the sandbox map's generated floor and walls.
+    pub(crate) fn from_tris(verts: Vec<Vec3>, tris: impl Iterator<Item = ([u32; 3], u32)>) -> Self {
+        let nv = verts.len();
+        let mut t = Terrain { verts, tris: Vec::new(), normals: Vec::new(), materials: Vec::new(), cells: HashMap::new(), min_walk_ny: MAX_SLOPE_DEGREES.to_radians().cos(), helper_planes: 0, world: None };
+        for (tri, material) in tris {
+            if tri.iter().any(|&x| x as usize >= nv) {
+                continue;
+            }
+            let [a, b, c] = tri.map(|x| t.verts[x as usize]);
+            let n = (b - a).cross(c - a);
+            if n.length_squared() < 1e-12 {
+                continue;
+            }
+            // The h9xxxxx helper collisions without a hit material: their level planes (the
+            // Guardian Ape's h900702, a 66 m plane 0.4 m over the pond floor; the maps' kill
+            // planes far below) are not floors. Their walls (h900700, the arena's bounds) stay.
+            if material == u32::MAX && n.y.abs() >= t.min_walk_ny * n.length() {
+                t.helper_planes += 1;
+                continue;
+            }
+            let id = t.tris.len() as u32;
+            t.tris.push(tri);
+            t.normals.push(n.normalize());
+            t.materials.push(material);
+            let (x0, z0) = cell_of(a.x.min(b.x).min(c.x), a.z.min(b.z).min(c.z));
+            let (x1, z1) = cell_of(a.x.max(b.x).max(c.x), a.z.max(b.z).max(c.z));
+            for cx in x0..=x1 {
+                for cz in z0..=z1 {
+                    t.cells.entry((cx, cz)).or_default().push(id);
+                }
+            }
+        }
+        t
+    }
+
+    /// A whole play world's collision as the terrain (sekiro-rs's: sr_map.rs `collision`).
+    pub fn from_world(world: Arc<dyn WorldCollision>) -> Self {
+        let mut t = Self::from_tris(Vec::new(), std::iter::empty());
+        t.world = Some(world);
+        t
+    }
+
+    /// No terrain (the map switched to one without a `.hit`, or off).
+    pub(crate) fn clear() {
+        if let Ok(mut t) = TERRAIN.get_or_init(|| RwLock::new(None)).write() {
+            *t = None;
+        }
+    }
+
+    pub fn install(self) {
+        *TERRAIN.get_or_init(|| RwLock::new(None)).write().unwrap() = Some(Arc::new(self));
+    }
+
+    /// [`ceiling_stop`] on this terrain.
+    pub fn ceiling_stop(&self, to: Vec3, from_y: f32) -> Option<f32> {
+        let rise = to.y - from_y;
+        if rise <= 0.0 {
+            return None;
+        }
+        let w = self.world.as_ref()?;
+        w.ceiling([to.x, from_y - CAPSULE_HALF_HEIGHT, to.z], rise).map(|top| top.max(from_y - CAPSULE_HALF_HEIGHT) + CAPSULE_HALF_HEIGHT)
+    }
+
+    /// [`landing_y`] on this terrain.
+    fn landing(&self, centre: Vec3, fell: f32) -> f32 {
+        let feet = centre.y - CAPSULE_HALF_HEIGHT;
+        self.floor(centre.x, centre.z, feet + STEP_HEIGHT.max(fell + 0.05)).unwrap_or(feet - 100.0)
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.world.as_ref().map_or(self.tris.len(), |w| w.triangle_count())
+    }
+
+    fn corners(&self, t: u32) -> [Vec3; 3] {
+        self.tris[t as usize].map(|i| self.verts[i as usize])
+    }
+
+    fn gather(&self, min: Vec2, max: Vec2, out: &mut Vec<u32>) {
+        out.clear();
+        let (x0, z0) = cell_of(min.x, min.y);
+        let (x1, z1) = cell_of(max.x, max.y);
+        for cx in x0..=x1 {
+            for cz in z0..=z1 {
+                if let Some(c) = self.cells.get(&(cx, cz)) {
+                    out.extend_from_slice(c);
+                }
+            }
+        }
+        if x0 != x1 || z0 != z1 {
+            out.sort_unstable();
+            out.dedup();
+        }
+    }
+
+    /// The highest walkable surface under (x, z) no higher than `top`: (height, triangle).
+    /// Feet are not a point: a few centimetres around count too, so seams between triangles
+    /// do not drop the body.
+    pub fn floor_tri(&self, x: f32, z: f32, top: f32) -> Option<(f32, u32)> {
+        if let Some(w) = &self.world {
+            return w.floor_hit(x, z, top);
+        }
+        const R: f32 = 0.08;
+        // (the highest dry floor, the highest deep-water plane)
+        let (mut best, mut wet): (Option<(f32, u32)>, Option<(f32, u32)>) = (None, None);
+        for (dx, dz) in [(0.0, 0.0), (R, 0.0), (-R, 0.0), (0.0, R), (0.0, -R)] {
+            let (px, pz) = (x + dx, z + dz);
+            let Some(cell) = self.cells.get(&cell_of(px, pz)) else { continue };
+            for &t in cell {
+                if self.normals[t as usize].y.abs() < self.min_walk_ny {
+                    continue;
+                }
+                let [a, b, c] = self.corners(t);
+                if let Some(h) = height_on(px, pz, a, b, c) {
+                    let slot = if deep_water(self.materials[t as usize]) { &mut wet } else { &mut best };
+                    if h <= top && slot.is_none_or(|(bh, _)| h > bh) {
+                        *slot = Some((h, t));
+                    }
+                }
+            }
+        }
+        // Deep water over a bed is a surface to swim in, not a floor (swim.rs, `water_surface`);
+        // with nothing under it the plane is the floor (the Yasha Ape's pool, m11 51000000).
+        best.or(wet)
+    }
+
+    /// [`Terrain::floor`] as the enemies stand on it ([`WorldCollision::enemy_floor`]).
+    pub fn enemy_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        match &self.world {
+            Some(w) => w.enemy_floor(x, z, top),
+            None => self.floor(x, z, top),
+        }
+    }
+
+    pub fn floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        self.floor_tri(x, z, top).map(|(h, _)| h)
+    }
+
+    /// [`WorldCollision::foot_floor`] on this collision.
+    pub fn foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        match &self.world {
+            Some(w) => w.foot_floor(x, z, top),
+            None => self.floor(x, z, top),
+        }
+    }
+
+    /// [`WorldCollision::enemy_foot_floor`] on this collision.
+    pub fn enemy_foot_floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        match &self.world {
+            Some(w) => w.enemy_foot_floor(x, z, top),
+            None => self.floor(x, z, top),
+        }
+    }
+
+    /// `water_surface` on this collision.
+    pub fn water(&self, x: f32, z: f32, top: f32) -> Option<(f32, u32)> {
+        if let Some(w) = &self.world {
+            return w.water_surface(x, z, top);
+        }
+        self.cells
+            .get(&cell_of(x, z))?
+            .iter()
+            .filter(|&&tri| water_material(self.materials[tri as usize]))
+            .filter_map(|&tri| {
+                let [a, b, c] = self.corners(tri);
+                height_on(x, z, a, b, c).filter(|h| *h <= top).map(|h| (h, self.materials[tri as usize]))
+            })
+            .max_by(|p, q| p.0.total_cmp(&q.0))
+    }
+
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+        if let Some(w) = &self.world {
+            return w.raycast(origin, dir, max);
+        }
+        let end = origin + dir * max;
+        let mut tris = Vec::new();
+        self.gather(Vec2::new(origin.x.min(end.x), origin.z.min(end.z)), Vec2::new(origin.x.max(end.x), origin.z.max(end.z)), &mut tris);
+        let mut best: Option<f32> = None;
+        for t in tris {
+            let [a, b, c] = self.corners(t);
+            if let Some(d) = ray_triangle(origin, dir, a, b, c) {
+                if d <= max && best.is_none_or(|b| d < b) {
+                    best = Some(d);
+                }
+            }
+        }
+        best
+    }
+
+    /// Moves a body standing at `feet` by the horizontal `delta`, stopping at walls and
+    /// sliding along them. Returns the horizontal displacement actually made.
+    pub fn slide(&self, feet: Vec3, delta: Vec2) -> Vec2 {
+        self.slide_protected(feet, delta, 0)
+    }
+
+    /// [`Terrain::slide`] keeping to the fall-prevention walls `protect` asks for (the host's
+    /// world has them; the own map's collision does not).
+    pub fn slide_protected(&self, feet: Vec3, delta: Vec2, protect: u8) -> Vec2 {
+        self.slide_as(feet, delta, protect, None)
+    }
+
+    /// The slide for a body of either side: an enemy's (`enemy`: its map body's radius and
+    /// height) keeps to the world's enemy-only walls ([`WorldCollision::enemy_slide_sized`]),
+    /// Wolf's to the fall-prevention walls `protect` asks for.
+    pub fn slide_as(&self, feet: Vec3, delta: Vec2, protect: u8, enemy: Option<[f32; 2]>) -> Vec2 {
+        let len = delta.length();
+        if len < 1e-6 {
+            return Vec2::ZERO;
+        }
+        // Sub-steps of at most half the radius so a thin post cannot be stepped over (a tick's
+        // move is centimetres; the cap only bounds a wild teleport).
+        let steps = ((len / (RADIUS * 0.5)).ceil() as usize).clamp(1, 512);
+        let gates = self.gates_on();
+        let gate_tris: Vec<Vec<u32>> = gates.iter().map(|g| (0..g.tris.len() as u32).collect()).collect();
+        // sekiro-rs's world slides the body; the fog walls on it push it back out after.
+        if let Some(w) = &self.world {
+            let moved = Vec2::from(match enemy {
+                Some([radius, height]) => w.enemy_slide_sized(feet.to_array(), delta.to_array(), radius, height),
+                None => w.slide_protected(feet.to_array(), delta.to_array(), protect),
+            });
+            let mut p = feet + Vec3::new(moved.x, 0.0, moved.y);
+            for _ in 0..4 {
+                let push = gates.iter().zip(&gate_tris).map(|(g, t)| g.push_out(p, t)).max_by(|a, b| a.length_squared().total_cmp(&b.length_squared())).unwrap_or(Vec2::ZERO);
+                if push == Vec2::ZERO {
+                    break;
+                }
+                p.x += push.x;
+                p.z += push.y;
+            }
+            return Vec2::new(p.x - feet.x, p.z - feet.z);
+        }
+        let mut p = feet;
+        let mut tris = Vec::new();
+        let reach = RADIUS + len / steps as f32 + 0.05;
+        self.gather(
+            Vec2::new(p.x.min(p.x + delta.x), p.z.min(p.z + delta.y)) - reach,
+            Vec2::new(p.x.max(p.x + delta.x), p.z.max(p.z + delta.y)) + reach,
+            &mut tris,
+        );
+        for _ in 0..steps {
+            p.x += delta.x / steps as f32;
+            p.z += delta.y / steps as f32;
+            for _ in 0..4 {
+                let mut push = self.push_out(p, &tris);
+                for (g, t) in gates.iter().zip(&gate_tris) {
+                    let gp = g.push_out(p, t);
+                    if gp.length_squared() > push.length_squared() {
+                        push = gp;
+                    }
+                }
+                if push == Vec2::ZERO {
+                    break;
+                }
+                p.x += push.x;
+                p.z += push.y;
+            }
+        }
+        Vec2::new(p.x - feet.x, p.z - feet.z)
+    }
+
+    /// The fog-wall collision switched on for this terrain ([`set_gates_on`]); none for any other
+    /// terrain (a test's, or a map loaded since).
+    fn gates_on(&self) -> Vec<Arc<Terrain>> {
+        GATES_ON.get().and_then(|g| g.read().ok()).filter(|g| g.0.as_ref().is_some_and(|t| std::ptr::eq(Arc::as_ptr(t), self))).map(|g| g.1.clone()).unwrap_or_default()
+    }
+
+    fn push_out(&self, feet: Vec3, tris: &[u32]) -> Vec2 {
+        let mut total = Vec2::ZERO;
+        for h in SPHERES {
+            let centre = feet + Vec3::Y * h;
+            let mut push = Vec2::ZERO;
+            for &t in tris {
+                let [a, b, c] = self.corners(t);
+                let q = closest_on_triangle(centre, a, b, c);
+                let away = centre - q;
+                let dist = away.length();
+                if dist >= RADIUS {
+                    continue;
+                }
+                // Horizontal pushes only; a contact straight above or below (beam, floor) is
+                // left to the floor query.
+                let flat = Vec2::new(away.x, away.z);
+                let dir = if flat.length_squared() > 1e-8 {
+                    flat.normalize()
+                } else {
+                    let n = self.normals[t as usize];
+                    let nf = Vec2::new(n.x, n.z);
+                    if nf.length_squared() < 1e-4 {
+                        continue;
+                    }
+                    nf.normalize()
+                };
+                let needed = (RADIUS * RADIUS - away.y * away.y).max(0.0).sqrt();
+                let depth = needed - flat.dot(dir);
+                if depth > push.dot(dir) {
+                    push += dir * (depth - push.dot(dir));
+                }
+            }
+            if push.length_squared() > total.length_squared() {
+                total = push;
+            }
+        }
+        total
+    }
+}
+
+fn height_on(x: f32, z: f32, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
+    if d.abs() < 1e-9 {
+        return None;
+    }
+    let l1 = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
+    let l2 = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
+    let l3 = 1.0 - l1 - l2;
+    (l1 >= 0.0 && l2 >= 0.0 && l3 >= 0.0).then(|| l1 * a.y + l2 * b.y + l3 * c.y)
+}
+
+/// Moller-Trumbore, both faces.
+fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = d.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-9 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let t = o - a;
+    let u = t.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = t.cross(e1);
+    let v = d.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let dist = e2.dot(q) * inv;
+    (dist > 0.0).then_some(dist)
+}
+
+/// Closest point on triangle abc to p (Ericson, Real-Time Collision Detection 5.1.5).
+fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
+    let (ab, ac, ap) = (b - a, c - a, p - a);
+    let (d1, d2) = (ab.dot(ap), ac.dot(ap));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return a;
+    }
+    let bp = p - b;
+    let (d3, d4) = (ab.dot(bp), ac.dot(bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return b;
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return a + ab * (d1 / (d1 - d3));
+    }
+    let cp = p - c;
+    let (d5, d6) = (ab.dot(cp), ac.dot(cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return c;
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return a + ac * (d2 / (d2 - d6));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    a + ab * (vb * denom) + ac * (vc * denom)
+}
+
+/// The longest step one fixed tick can take as a walk (2 m at 60 Hz is 120 m/s, past any dash
+/// or grapple pull); a longer one is a teleport and skips the wall slide.
+pub const TELEPORT: f32 = 2.0;
+
+/// Whether a body's move since its last update (`delta`, flat) is a walk the wall slide follows,
+/// not a warp. A body on a slow update level (Actor::lod) moves `lod` ticks' time at once
+/// (actor.rs `advance`), so its walk may be up to TELEPORT per tick of that: an off-screen
+/// enemy at every 30th tick running 6 m/s steps 3 m, which a flat TELEPORT took for a warp and
+/// let through walls. A warp marked by its writer (Actor::warped: a respawn or a map script's
+/// warp) is never a walk, however short.
+pub(crate) fn walks(delta: Vec2, lod: u32, warped: bool) -> bool {
+    let walk = TELEPORT * lod.max(1) as f32;
+    !warped && delta.length_squared() > 1e-10 && delta.length_squared() <= walk * walk
+}
+
+/// The floor a body that moved from `prev_feet` to `now_feet` in one go stands on, walked along
+/// the move with the per-tick rule (each sample's floor at most STEP_HEIGHT over the last, at
+/// most FALL_START_DROP under it); `None` where the walk stops on a rise or drop past that.
+/// An enemy on a slow update level (Actor::lod, up to every 30th tick) takes up to 30 ticks'
+/// move at once, 2-2.5 m when running, so one query at the end looked only 0.5 m over its old
+/// feet: up a slope or stairs it found no floor, fell inside the hill and died "into the void".
+/// The sub-step keeps the rise under STEP_HEIGHT and the drop under FALL_START_DROP on the
+/// steepest walkable slope (MAX_SLOPE_DEGREES), so a body never snaps up onto a bridge or
+/// balcony over it, as scaling STEP_HEIGHT by the level would.
+pub(crate) fn follow_floor(t: &Terrain, prev_feet: Vec3, now_feet: Vec3, enemy: bool) -> Option<f32> {
+    let sub = crate::player::FALL_START_DROP.min(STEP_HEIGHT) / MAX_SLOPE_DEGREES.to_radians().tan();
+    let delta = Vec2::new(now_feet.x - prev_feet.x, now_feet.z - prev_feet.z);
+    let n = (delta.length() / sub).ceil().max(1.0) as u32;
+    let mut h = now_feet.y;
+    for i in 1..=n {
+        let p = Vec2::new(prev_feet.x, prev_feet.z) + delta * (i as f32 / n as f32);
+        let top = h + STEP_HEIGHT;
+        let floor = if enemy { t.enemy_floor(p.x, p.y, top) } else { t.floor(p.x, p.y, top) };
+        h = floor.filter(|f| *f >= h - crate::player::FALL_START_DROP)?;
+    }
+    Some(h)
+}
+
+/// Where the actor was before this tick's movement, for the wall slide.
+#[derive(Component)]
+pub struct OnTerrain {
+    pub(crate) prev: Vec3,
+}
+
+/// After the actors moved: push them out of walls along their step, then put grounded ones on
+/// the floor (following it up to STEP_HEIGHT up and FALL_START_DROP down; a bigger drop leaves them in the air,
+/// which player.rs turns into FreeFall; enemies stay put, they have no fall of their own).
+pub(crate) fn bodies_on_terrain(combat: Res<crate::data::Combat>, mut commands: Commands, mut q: Query<(Entity, &mut Actor, &mut Transform, Option<&mut OnTerrain>)>) {
+    let _prof = crate::perf::span("bodies_on_terrain");
+    let Some(t) = terrain() else { return };
+    for (e, mut a, mut tf, state) in &mut q {
+        let Some(mut state) = state else {
+            commands.entity(e).insert(OnTerrain { prev: tf.translation });
+            a.warped = false;
+            continue;
+        };
+        // Not due this tick (Actor::lod): the next due tick takes the whole move.
+        if !a.lod_due {
+            continue;
+        }
+        let warped = std::mem::take(&mut a.warped);
+        // Held at an edge (docking.rs hold places the body): no slide, no floor snap.
+        if a.docked {
+            state.prev = tf.translation;
+            continue;
+        }
+        let prev = state.prev;
+        let feet_prev = prev - Vec3::Y * CAPSULE_HALF_HEIGHT;
+        let delta = Vec2::new(tf.translation.x - prev.x, tf.translation.z - prev.z);
+        // A move longer than TELEPORT a tick (`walks`) is a warp (script / event warps, the
+        // parking spot, fight resets), not a walk: no slide along the line. The slide gathered
+        // every triangle in the whole move's box and ran 512 substeps, so a 110 m script warp on
+        // the Folding Screen Monkeys arena stalled one frame for about 33 s, then stopped at the
+        // first wall and undid the warp (the fight's "3 fps", 2026-10-12 bug hunt).
+        if walks(delta, a.lod, warped) {
+            let _p = crate::perf::span("terrain_slide");
+            // An enemy's map body: its NpcParam hitRadius / hitHeight (Wolf's size for a row
+            // without one).
+            let enemy = (a.side == Side::Enemy).then(|| {
+                let row = combat.param("NpcParam", combat.foe_of(&a).npc_row);
+                let size = |k: &str, or: f32| row[k].as_f64().map_or(or, |v| v as f32);
+                match [size("hitRadius", 0.0), size("hitHeight", 0.0)] {
+                    [r, h] if r > 0.0 && h > 0.0 => [r, h],
+                    _ => [RADIUS, 2.0 * CAPSULE_HALF_HEIGHT],
+                }
+            });
+            let moved = t.slide_as(feet_prev, delta, a.fall_protect, enemy);
+            tf.translation.x = prev.x + moved.x;
+            tf.translation.z = prev.z + moved.y;
+        }
+        let data = crate::actor::data_for(&combat, &a);
+        let lifted = !a.anim.is_empty() && data.flag(&a.anim, a.t, crate::player::FLAG_NO_GRAVITY);
+        // An enemy coming down from a SetNoGravity lift (actor.rs) lands by itself.
+        if !a.airborne && !lifted && a.lift_ground.is_none() {
+            let feet = tf.translation.y - CAPSULE_HALF_HEIGHT;
+            let pf = crate::perf::span("terrain_floor");
+            let enemy = a.side == Side::Enemy;
+            let single = || if enemy { t.enemy_floor(tf.translation.x, tf.translation.z, feet + STEP_HEIGHT) } else { t.floor(tf.translation.x, tf.translation.z, feet + STEP_HEIGHT) };
+            // A body on a slow update level walks its whole move's floor (`follow_floor`); a
+            // warp (longer than TELEPORT a tick) keeps the single query at its end.
+            let walked = a.lod > 1 && !warped && delta.length() <= TELEPORT * a.lod as f32;
+            let floor = if walked { follow_floor(&t, feet_prev.with_y(feet), tf.translation - Vec3::Y * CAPSULE_HALF_HEIGHT, enemy).or_else(single) } else { single() };
+            drop(pf);
+            // A body follows the floor down only FALL_START_DROP (HKS BEH_R_FALL: a smaller drop
+            // never leaves the move state, so following it is the same); a deeper one falls
+            // (Wolf: player.rs; an enemy: `enemy_falls`). Over a drop its rim still rests on, it
+            // is held at the edge (`rim_floor`).
+            let down = crate::player::FALL_START_DROP;
+            let floor = match floor {
+                Some(h) if h >= feet - down => Some(h),
+                _ => rim_floor(tf.translation).or(floor),
+            };
+            if let Some(h) = floor.filter(|h| *h >= feet - down) {
+                tf.translation.y = h + CAPSULE_HALF_HEIGHT;
+            }
+        }
+        state.prev = tf.translation;
+    }
+}
+
+#[cfg(test)]
+mod fall_tests {
+    use super::*;
+
+    /// An off-screen enemy (update level 30, enemy/world.rs) running 6 m/s moves 3 m in one due
+    /// tick: still a walk the wall slide follows, not a warp that passes through walls; a
+    /// 60 m+ move on that level and a 3 m one at every tick stay warps.
+    #[test]
+    fn a_slow_update_levels_run_still_slides_on_walls() {
+        let run = Vec2::new(3.0, 0.0);
+        assert!(walks(run, crate::actor::ASLEEP, false));
+        assert!(!walks(run, 1, false));
+        assert!(walks(Vec2::new(1.5, 0.0), 1, false));
+        assert!(!walks(Vec2::new(0.0, 61.0), crate::actor::ASLEEP, false));
+        assert!(!walks(Vec2::ZERO, crate::actor::ASLEEP, false));
+    }
+
+    /// A respawn or map-script warp a few metres away on a slow level is still a warp (no slide
+    /// back toward where it was), and a level of 0 counts as every tick.
+    #[test]
+    fn a_marked_warp_never_slides() {
+        assert!(!walks(Vec2::new(3.0, 0.0), crate::actor::ASLEEP, true));
+        assert!(!walks(Vec2::new(0.5, 0.0), 1, true));
+        assert!(walks(Vec2::new(1.0, 0.0), 0, false));
+    }
+
+    /// Atlas movement.fall-damage: exe FUN_140843660 - nothing under 20 m, then h / 100 of max HP
+    /// (CalcCorrectGraph 210), all of it from 100 m; half on the deep-water planes (HitMtrlParam
+    /// 22 fallDamageRate 0.5); none on a disableFallDamage row; from 5 m when aged (the caller's
+    /// `from`, graph 210 floors at 20 %).
+    #[test]
+    fn fall_damage_is_a_hundredth_of_max_hp_per_metre_from_twenty() {
+        assert_eq!(fall_damage_share(19.9, None, 20.0), 0.0);
+        assert!((fall_damage_share(25.0, None, 20.0) - 0.25).abs() < 1e-6);
+        assert!((fall_damage_share(150.0, None, 20.0) - 1.0).abs() < 1e-6);
+        assert!((fall_damage_share(30.0, Some(22), 20.0) - 0.15).abs() < 1e-6);
+        assert!((fall_damage_share(6.0, None, 5.0) - 0.2).abs() < 1e-6);
+        let off = hit_mtrl_fall().iter().find(|(_, r)| r.1).map(|(id, _)| *id).expect("a disableFallDamage row");
+        assert_eq!(fall_damage_share(30.0, Some(off), 20.0), 0.0);
+    }
+
+    /// Atlas movement.swim-surface: a deep water plane (HitMtrlParam 22) 3 m over a lakebed is no
+    /// floor (Wolf sinks through it to swim) but is the water's surface; a walkable one (21) is
+    /// a floor.
+    #[test]
+    fn a_deep_water_plane_is_a_surface_not_a_floor() {
+        let quad = |y: f32| [Vec3::new(-5.0, y, -5.0), Vec3::new(5.0, y, -5.0), Vec3::new(5.0, y, 5.0), Vec3::new(-5.0, y, 5.0)];
+        for (m, floor) in [(22u32, 0.0f32), (21, 3.0)] {
+            let mut verts = quad(0.0).to_vec();
+            verts.extend(quad(3.0));
+            let t = Terrain::from_tris(verts, [([0, 2, 1], 45), ([0, 3, 2], 45), ([4, 6, 5], m), ([4, 7, 6], m)].into_iter());
+            assert_eq!(t.floor(0.0, 0.0, 10.0), Some(floor), "material {m}");
+            assert_eq!(t.water(0.0, 0.0, 10.0), Some((3.0, m)));
+            assert_eq!(t.water(0.0, 0.0, 2.0), None, "under the feet only");
+        }
+        // With no bed under it the plane is the floor.
+        let t = Terrain::from_tris(quad(3.0).to_vec(), [([0, 2, 1], 22), ([0, 3, 2], 22)].into_iter());
+        assert_eq!(t.floor(0.0, 0.0, 10.0), Some(3.0));
+    }
+
+    /// A body falling 0.7 m a tick (about 42 m/s) whose feet passed 0.6 m below a thin floor
+    /// lands on it; one that fell past a bridge into the void keeps falling instead of being put
+    /// back on top of it.
+    #[test]
+    fn a_fast_fall_lands_on_a_thin_floor_and_never_snaps_up_onto_one() {
+        let quad = [Vec3::new(-5.0, 10.0, -5.0), Vec3::new(5.0, 10.0, -5.0), Vec3::new(5.0, 10.0, 5.0), Vec3::new(-5.0, 10.0, 5.0)];
+        let t = Terrain::from_tris(quad.to_vec(), [([0, 2, 1], 45), ([0, 3, 2], 45)].into_iter());
+        let centre = |feet: f32| Vec3::new(0.0, feet + CAPSULE_HALF_HEIGHT, 0.0);
+        assert_eq!(t.landing(centre(9.4), 0.7), 10.0);
+        assert!(t.landing(centre(5.0), 0.7) < -50.0);
+    }
+
+    /// An enemy on update level 30 (enemy/world.rs, 0.5 s a step) running 4.5 m/s up a 30 deg
+    /// ramp moves 2.25 m at once: walking the move puts it on the ramp 1.3 m up (2.25 x tan 30),
+    /// not on a ledge 2.5 m over it, where the one query at the end found no floor at all (it
+    /// fell inside the hill and died).
+    #[test]
+    fn a_slow_update_body_follows_a_slope_it_ran_up_in_one_step() {
+        let rise = 30f32.to_radians().tan();
+        let end = 2.25 * rise;
+        let mut verts = vec![Vec3::new(0.0, 0.0, -5.0), Vec3::new(10.0, 10.0 * rise, -5.0), Vec3::new(10.0, 10.0 * rise, 5.0), Vec3::new(0.0, 0.0, 5.0)];
+        let y = end + 2.5;
+        verts.extend([Vec3::new(1.5, y, -1.0), Vec3::new(3.0, y, -1.0), Vec3::new(3.0, y, 1.0), Vec3::new(1.5, y, 1.0)]);
+        let t = Terrain::from_tris(verts, [([0, 2, 1], 45), ([0, 3, 2], 45), ([4, 6, 5], 45), ([4, 7, 6], 45)].into_iter());
+        let (from, to) = (Vec3::ZERO, Vec3::new(2.25, 0.0, 0.0));
+        let h = follow_floor(&t, from, to, true).expect("the ramp");
+        // (floor_tri's 0.08 m foot spread reads the ramp up to 0.05 m higher)
+        assert!((h - end).abs() < 0.06, "{h} vs {end}");
+        assert!(t.enemy_floor(to.x, to.z, to.y + STEP_HEIGHT).is_none(), "the single query finds nothing");
+        // Down the same ramp in one step too, and a full-rate step is the single query.
+        assert!((follow_floor(&t, Vec3::new(2.25, end, 0.0), Vec3::new(0.5, end, 0.0), true).unwrap() - 0.5 * rise).abs() < 0.06);
+        assert!((follow_floor(&t, Vec3::ZERO, Vec3::new(0.1, 0.0, 0.0), false).unwrap() - 0.1 * rise).abs() < 0.06);
+    }
+}

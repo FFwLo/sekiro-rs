@@ -1,0 +1,1233 @@
+//! Real animation playback: skeletons and spline-decoded clips exported by
+//! tools/sekiro-extract (extracted/anim_<chr>.bin), posed every sim tick (FixedUpdate,
+//! `PoseSet`) from the actor's current anim and clock, drawn between the last two ticks' poses,
+//! and as bone lines without a model.
+
+use bevy::prelude::*;
+use std::collections::{HashMap, HashSet};
+
+use crate::actor::{Actor, Side, data_for};
+use crate::data::{CharData, Combat};
+use crate::player::CAPSULE_HALF_HEIGHT;
+
+pub struct BoneDef {
+    pub name: String,
+    pub parent: i16,
+    pub pose: Transform,
+}
+
+pub struct Clip {
+    pub frame_duration: f32,
+    pub frames: usize,
+    pub track_to_bone: Vec<i16>,
+    /// frames * tracks transforms (game space).
+    pub data: Vec<Transform>,
+}
+
+#[derive(Default)]
+pub struct Lib {
+    pub bones: Vec<BoneDef>,
+    pub clips: HashMap<String, Clip>,
+}
+
+#[derive(Resource, Default)]
+pub struct AnimLib {
+    pub player: Lib,
+    /// A friendly NPC's library is independent of the replaceable encounter slots.
+    sculptor: Option<Lib>,
+    /// Per enemy kind (`Combat::kinds`); kinds with the same anim chr share one.
+    pub enemies: Vec<std::sync::Arc<Lib>>,
+    /// The anim chr of each `enemies` entry, and the chrs whose anim_c0000_<chr>.bin (Wolf's
+    /// clips against them) are in `player`.
+    enemy_chrs: Vec<String>,
+    player_vs: HashSet<String>,
+}
+
+impl AnimLib {
+    /// Follows `Combat::kinds` after an encounter swap (Combat::load_encounter): each kind's
+    /// clips (loaded once per anim chr, kept from before when the chr is the same) and Wolf's
+    /// clips against each new chr.
+    pub fn sync_kinds(&mut self, combat: &Combat) {
+        let dir = crate::paths::root().join("extracted");
+        for k in &combat.kinds {
+            for c in [&k.foe.anim_chr, &k.foe.chr] {
+                let p = dir.join(format!("anim_c0000_{c}.bin"));
+                if self.player_vs.insert(c.clone()) && p.exists() {
+                    self.player.clips.extend(load(&p).clips);
+                }
+            }
+        }
+        let old: HashMap<String, std::sync::Arc<Lib>> = self.enemy_chrs.drain(..).zip(self.enemies.drain(..)).collect();
+        let mut by_chr = old;
+        for k in &combat.kinds {
+            let chr = &k.foe.anim_chr;
+            let lib = by_chr.entry(chr.clone()).or_insert_with(|| std::sync::Arc::new(load(&dir.join(format!("anim_{chr}.bin"))))).clone();
+            self.enemies.push(lib);
+            self.enemy_chrs.push(chr.clone());
+        }
+    }
+
+    pub fn lib(&self, a: &crate::actor::Actor) -> &Lib {
+        if a.kind == crate::data::NPC_KIND {
+            if let Some(sculptor) = &self.sculptor {
+                return sculptor;
+            }
+        }
+        match a.side {
+            Side::Player => &self.player,
+            Side::Enemy => self.enemies.get(a.kind).or(self.enemies.first()).map_or(&self.player, |l| l.as_ref()),
+        }
+    }
+}
+
+/// Havok -> game space: mirror X (same convention as the root motion export).
+fn convert(v: &[f32]) -> Transform {
+    Transform {
+        translation: Vec3::new(-v[0], v[1], v[2]),
+        rotation: Quat::from_xyzw(v[3], -v[4], -v[5], v[6]).normalize(),
+        scale: Vec3::new(v[7], v[8], v[9]),
+    }
+}
+
+/// A part's clips (model/tool.rs: the prosthetic tools' anim bins); empty when the file is absent.
+pub(crate) fn load_lib(path: &std::path::Path) -> Lib {
+    if path.exists() { load(path) } else { Lib::default() }
+}
+
+fn load(path: &std::path::Path) -> Lib {
+    let Ok(d) = std::fs::read(path) else {
+        warn!("{} missing; characters will show as capsules", path.display());
+        return Lib::default();
+    };
+    let u16_ = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+    let u32_ = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+    let f32s = |o: usize, n: usize| -> Vec<f32> { (0..n).map(|i| f32::from_le_bytes(d[o + i * 4..o + i * 4 + 4].try_into().unwrap())).collect() };
+    assert_eq!(&d[0..4], b"SHAN");
+    let mut o = 8;
+    let nb = u32_(o) as usize;
+    o += 4;
+    let mut bones = Vec::with_capacity(nb);
+    for _ in 0..nb {
+        let l = u16_(o) as usize;
+        o += 2;
+        let name = String::from_utf8_lossy(&d[o..o + l]).into_owned();
+        o += l;
+        let parent = u16_(o) as i16;
+        o += 2;
+        let pose = convert(&f32s(o, 10));
+        o += 40;
+        bones.push(BoneDef { name, parent, pose });
+    }
+    let nc = u32_(o) as usize;
+    o += 4;
+    let mut clips = HashMap::with_capacity(nc);
+    for _ in 0..nc {
+        let l = u16_(o) as usize;
+        o += 2;
+        let key = String::from_utf8_lossy(&d[o..o + l]).into_owned();
+        o += l;
+        let frame_duration = f32s(o, 1)[0];
+        let frames = u32_(o + 4) as usize;
+        let tracks = u32_(o + 8) as usize;
+        o += 12;
+        let track_to_bone: Vec<i16> = (0..tracks).map(|i| u16_(o + i * 2) as i16).collect();
+        o += tracks * 2;
+        let mut data = Vec::with_capacity(frames * tracks);
+        for k in 0..frames * tracks {
+            data.push(convert(&f32s(o + k * 40, 10)));
+        }
+        o += frames * tracks * 40;
+        clips.insert(key, Clip { frame_duration, frames, track_to_bone, data });
+    }
+    Lib { bones, clips }
+}
+
+/// Skeleton construction (models attach after it).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AnimSet;
+
+/// FixedUpdate, between ActorSet::Advance and ActorSet::Resolve: this tick's pose at the sim's
+/// anim time, with the skeletons' GlobalTransforms already updated, so the hit test, bullets
+/// and effects that read dummy polys see where the swing is now (they saw the last drawn
+/// frame's pose before: one tick old at 60 fps, more below it).
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PoseSet;
+
+/// Marks a character whose real mesh is attached (bone lines are then hidden).
+#[derive(Component)]
+pub struct HasModel;
+
+/// Hurtbox capsules: two marker entities (endpoints, parented to the bone) and the
+/// radius, from the ragdoll bodies in the character's physics HKX; and each one's NPC part group
+/// (0 = none).
+#[derive(Component)]
+pub struct Hurtboxes(pub Vec<(Entity, Entity, f32)>, pub Vec<u8>);
+
+/// A throw absorb's model slide: ThrowParam adsrobModelPosInterpolationTime (Paramdex SDT:
+/// after the capsule is absorbed onto the dummy poly, the time the character model takes to
+/// move to the anim data's position; 0 = none). `offset` is where the model stood relative to
+/// the capsule's new spot (world, horizontal); it shrinks to zero over `time`. gap: the exe's
+/// curve is not traced (linear here).
+#[derive(Component)]
+pub struct ModelLag {
+    pub offset: Vec3,
+    pub time: f32,
+    pub left: f32,
+}
+
+/// A character put back without moving there (Wolf's fight reset, an enemy's respawn): its next
+/// posed tick snaps to the new clip instead of fading from the old life's pose, the drawn pose
+/// does not lerp from it, and a running ModelLag ends (2026-10-12 bug hunt round 17).
+#[derive(Component)]
+pub struct SnapPose;
+
+/// Bone entities of one character, indexed like the skeleton.
+#[derive(Component)]
+pub struct Skeleton {
+    pub bones: Vec<Entity>,
+    /// The "SkeletonRoot" entity (feet level under the actor; ModelLag moves it).
+    pub root: Entity,
+    /// Clip shown last frame, and the pose to crossfade from after a clip change.
+    pub(crate) shown: String,
+    /// The state clock the shown clip was drawn at last frame (a restart of the same clip runs it
+    /// back to 0).
+    shown_t: f32,
+    from: Vec<Transform>,
+    /// Last pose written by pose_skeletons (before the twist layer), the start of crossfades:
+    /// snapshotting the bone transforms instead would bake that frame's twist into the fade.
+    last: Vec<Transform>,
+    /// Bones the last shown clip had a track for, and those of the clip faded from: a bone the
+    /// old clip did not animate does not fade from its reference pose.
+    last_tracked: Vec<bool>,
+    from_tracked: Vec<bool>,
+    pub(crate) blend: f32,
+    /// Crossfade length into the current clip (TAE Blend event, else CROSSFADE).
+    blend_len: f32,
+    /// Last tick showed an upper action (its legs were the walk/run loop already).
+    was_upper: bool,
+    /// The clip shown last tick as the lib holds it, its time and whether it loops: the source of
+    /// the next crossfade, which plays on under the fade (`fade_src`).
+    shown_src: Option<(String, f32, bool)>,
+    /// The crossfade's source clip still playing (key, time, loops), as Havok's blend runs the
+    /// source generator on through the transition (before: a frozen snapshot, so a combo chain or
+    /// a walk turn looked like one motion stopping dead and the next snapping in; the user:
+    /// "sword swings ... look too sudden"). None when the fade starts mid-fade (the frozen pose).
+    fade_src: Option<(String, f32, bool)>,
+    /// The actor's yaw at the last pose, and the model's yaw offset at the start of the running
+    /// fade: an action start that snaps the heading (player.rs `aim`: an attack pressed the other
+    /// way mid-combo) turns the model over the fade instead of in one frame (the user: "it has the
+    /// same snap").
+    yaw_seen: Option<f32>,
+    yaw_off: f32,
+    /// The running crossfade leaves the legs alone (upper action -> its move loop: the legs keep
+    /// the same loop at the same time, so only the upper body fades).
+    upper_fade: bool,
+    /// Bone local transforms (then the root's) of the last two sim ticks, drawn in between.
+    sim: [Vec<Transform>; 2],
+}
+
+/// Crossfade into an anim: its TAE "Blend" event (type 16, frames 0-N; most anims have
+/// one: player 3-6 frames, c1020 1-15) or, without one, this default.
+/// Behavior-graph transition effects all have duration 0 (sekiro-extract transitions), so
+/// crossfades come from the target clip's TAE Blend; this is only for clips without TAE.
+const CROSSFADE: f32 = 0.12;
+
+pub struct AnimPlugin;
+
+impl Plugin for AnimPlugin {
+    fn build(&self, app: &mut App) {
+        let dir = crate::paths::root().join("extracted");
+        // (anim chr, chr) of each enemy kind.
+        let kinds: Vec<(String, String)> = app
+            .world()
+            .get_resource::<Combat>()
+            .map(|c| c.kinds.iter().map(|k| (k.foe.anim_chr.clone(), k.foe.chr.clone())).collect())
+            .unwrap_or_else(|| vec![("c1020".to_string(), "c1020".to_string())]);
+        let mut player = load(&dir.join("anim_c0000.bin"));
+        // Wolf's clips against each enemy (deathblows, grabs: chr/c0000_c<chr>.anibnd, which the
+        // exe loads per enemy as "chranibnd:/c0000_c%04d.anibnd"), exported to
+        // anim_c0000_<chr>.bin. (Their anim groups differ per enemy, so they merge.)
+        let mut done = HashSet::new();
+        for (chr, own) in &kinds {
+            for c in [chr, own] {
+                let p = dir.join(format!("anim_c0000_{c}.bin"));
+                if done.insert(c.clone()) && p.exists() {
+                    player.clips.extend(load(&p).clips);
+                }
+            }
+        }
+        let mut by_chr: HashMap<String, std::sync::Arc<Lib>> = HashMap::new();
+        let enemies = kinds
+            .iter()
+            .map(|(chr, _)| by_chr.entry(chr.clone()).or_insert_with(|| std::sync::Arc::new(load(&dir.join(format!("anim_{chr}.bin"))))).clone())
+            .collect();
+        let enemy_chrs = kinds.iter().map(|(chr, _)| chr.clone()).collect();
+        let sculptor = app.world().get_resource::<Combat>().and_then(|c| c.sculptor.as_ref()).map(|k| load(&dir.join(format!("anim_{}.bin", k.foe.anim_chr))));
+        app.insert_resource(AnimLib { player, sculptor, enemies, enemy_chrs, player_vs: done })
+            .add_systems(PostStartup, build_skeletons.in_set(AnimSet))
+            // Characters spawned later (a fight reset's line-up, the encounter picker).
+            .add_systems(Update, build_skeletons.in_set(AnimSet).before(draw_poses))
+            .configure_sets(FixedUpdate, PoseSet.after(crate::actor::ActorSet::Advance).before(crate::actor::ActorSet::Resolve))
+            .add_systems(FixedUpdate, (pose_skeletons, apply_walk_twist, apply_twists, apply_model_lag, foot_ik, store_sim_poses).chain().in_set(PoseSet))
+            .add_systems(
+                Update,
+                // (No gizmos headless: sim tests with the real geometry, model.rs GeometryPlugin.)
+                (draw_poses, draw_skeletons.run_if(resource_exists::<bevy::gizmos::config::GizmoConfigStore>))
+                    .chain()
+                    .before(TransformSystems::Propagate),
+            );
+    }
+}
+
+fn build_skeletons(
+    mut commands: Commands,
+    lib: Res<AnimLib>,
+    combat: Res<Combat>,
+    actors: Query<(Entity, &Actor, Option<&Children>), Without<Skeleton>>,
+    blades: Query<(), With<crate::model::Blade>>,
+) {
+    for (e, a, children) in &actors {
+        let l = lib.lib(&a);
+        if l.bones.is_empty() {
+            continue;
+        }
+        // Feet level: the actor's origin is the capsule middle.
+        let root = commands.spawn((Transform::from_xyz(0.0, -CAPSULE_HALF_HEIGHT, 0.0), Visibility::default(), Name::new("SkeletonRoot"))).id();
+        commands.entity(e).add_child(root);
+        let bones: Vec<Entity> = l
+            .bones
+            .iter()
+            .map(|b| commands.spawn((b.pose, Visibility::default(), Name::new(b.name.clone()))).id())
+            .collect();
+        for (i, b) in l.bones.iter().enumerate() {
+            let parent = if b.parent >= 0 { bones[b.parent as usize] } else { root };
+            commands.entity(parent).add_child(bones[i]);
+        }
+        // Blade onto the weapon bone. Player: R_Weapon, blade along its local -Y.
+        // Enemy: R_Hand, blade toward the R_Katana_long tip bone.
+        let find = |n: &str| l.bones.iter().position(|b| b.name == n);
+        let mount = match a.side {
+            Side::Player => find("R_Weapon").map(|i| (i, Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)))),
+            Side::Enemy => find("R_Hand").zip(find("R_Katana_long")).map(|(hand, tip)| {
+                let dir = l.bones[tip].pose.translation;
+                let rot = Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize());
+                (hand, Transform::from_rotation(rot).with_scale(Vec3::new(1.0, 1.0, dir.length())))
+            }),
+        };
+        if let (Some((bone, tf)), Some(children)) = (mount, children) {
+            for c in children.iter().filter(|c| blades.contains(*c)) {
+                commands.entity(bones[bone]).add_child(c);
+                commands.entity(c).insert(tf);
+            }
+        }
+        // Hurtboxes: ragdoll capsules (model space, bind pose) re-expressed in their bone's
+        // bind space, so they follow the animation.
+        let mut bind: Vec<Transform> = Vec::with_capacity(l.bones.len());
+        for (i, b) in l.bones.iter().enumerate() {
+            let parent = if b.parent >= 0 && (b.parent as usize) < i { bind[b.parent as usize] } else { Transform::IDENTITY };
+            bind.push(parent.mul_transform(b.pose));
+        }
+        let (mut boxes, mut parts) = (Vec::new(), Vec::new());
+        for h in &data_for(&combat, &a).hurtboxes {
+            let Some(bi) = find(&h.bone) else { continue };
+            let inv = bind[bi].compute_affine().inverse();
+            let mut marker = |p: [f32; 3]| {
+                let local = inv.transform_point3(Vec3::new(-p[0], p[1], p[2]));
+                let m = commands.spawn((Transform::from_translation(local), Name::new("Hurtbox"))).id();
+                commands.entity(bones[bi]).add_child(m);
+                m
+            };
+            let (ma, mb) = (marker(h.a), marker(h.b));
+            boxes.push((ma, mb, h.r));
+            parts.push(h.part);
+        }
+        if !boxes.is_empty() {
+            commands.entity(e).insert(Hurtboxes(boxes, parts));
+        }
+        // The skeleton replaces the placeholder capsule.
+        commands.entity(e).insert(Skeleton { bones, root, shown: String::new(), shown_t: 0.0, from: Vec::new(), last: Vec::new(), last_tracked: Vec::new(), from_tracked: Vec::new(), blend: 1.0, blend_len: CROSSFADE, was_upper: false, upper_fade: false, shown_src: None, fade_src: None, yaw_seen: None, yaw_off: 0.0, sim: [Vec::new(), Vec::new()] }).remove::<Mesh3d>();
+    }
+}
+
+/// Clip to show for an actor: its current anim (or the sibling it borrows a clip
+/// from), or a loop for procedural states.
+/// `t` is the anim time to pose (the sim's, `Actor.t`).
+/// The shown clip as a crossfade source: its key in the lib, its time (unwrapped) and whether it
+/// loops (the locomotion loops, idles and c0000's looping clips).
+fn src_of(lib: &Lib, d: &CharData, a: &Actor, t: f32) -> Option<(String, f32, bool)> {
+    let own = d.clip_key(&a.anim);
+    if lib.clips.contains_key(own) {
+        return Some((own.to_string(), t, a.side == Side::Player && crate::data::loops_c0000(&a.anim)));
+    }
+    let (key, t, looping) = if a.side == Side::Player && a.state == "Locomotion" {
+        a.locomotion_clip_at(t)
+    } else {
+        let (k, t) = a.proc_clip(t);
+        (k, t, true)
+    };
+    if lib.clips.contains_key(&key) {
+        return Some((key, t, looping));
+    }
+    let alt = format!("a000{}", key.get(4..).unwrap_or(""));
+    lib.clips.contains_key(&alt).then_some((alt, t, looping))
+}
+
+fn clip_for<'a>(lib: &'a Lib, d: &CharData, a: &Actor, t: f32) -> Option<(&'a Clip, f32)> {
+    if let Some(c) = lib.clips.get(d.clip_key(&a.anim)) {
+        return Some((c, t));
+    }
+    let (key, t) = a.proc_clip(t);
+    // A grouped key without a clip in the lib falls back to the a000 one.
+    let c = lib.clips.get(&key).or_else(|| lib.clips.get(&format!("a000{}", key.get(4..).unwrap_or(""))))?;
+    Some((c, c.wrap(t)))
+}
+
+impl Clip {
+    /// Loop time: Havok loops repeat frame 0 as their last frame (idle, walk/run loops, guard
+    /// idle: last vs first < 0.4 deg), so a cycle is frames - 1 intervals long.
+    fn wrap(&self, t: f32) -> f32 {
+        let len = (self.frames.max(2) - 1) as f32 * self.frame_duration;
+        t.rem_euclid(len.max(1e-3))
+    }
+}
+
+
+/// Upper-body layer mask (c0000.hkx StandMoveOverwrite LayerGenerator): the StandMoveUpper_SM
+/// layer's boneWeights are 0 for the first 39 bones (Master, foot targets, RootPos, Pelvis, both
+/// legs) and full above, so those bones keep the walk/run of StandMoveLower_SM.
+const LOWER_BODY_BONES: usize = 39;
+
+/// Key of the clip being shown: the TAE anim, or the procedural state's clip.
+fn clip_key(lib: &Lib, d: &CharData, a: &Actor, t: f32) -> String {
+    if lib.clips.contains_key(d.clip_key(&a.anim)) { a.anim.clone() } else { a.proc_clip(t).0 }
+}
+
+fn pose_skeletons(
+    lib: Res<AnimLib>,
+    combat: Res<Combat>,
+    mut actors: Query<(&Actor, &mut Skeleton, Has<SnapPose>)>,
+    mut tfs: Query<&mut Transform>,
+) {
+    let _prof = crate::perf::span("pose_skeletons");
+    for (a, mut skel, snap) in &mut actors {
+        // Not due (Actor::lod): it keeps its last pose.
+        if !a.lod_due && !snap {
+            continue;
+        }
+        if snap {
+            // No fade from the previous life's pose (an empty `shown` snaps in, blend = 1).
+            skel.shown.clear();
+            skel.last.clear();
+        }
+        let l = lib.lib(&a);
+        let d = data_for(&combat, &a);
+        let drawn = a.t;
+        let Some((clip, t)) = clip_for(l, d, a, drawn) else { continue };
+        let src_now = src_of(l, d, a, drawn);
+        let tracks = clip.track_to_bone.len();
+        if tracks == 0 || clip.frames == 0 {
+            continue;
+        }
+        // Clip changed: remember the current pose and fade from it.
+        let key = clip_key(l, d, a, drawn);
+        // The same action replayed from its start (the deflect spam chain re-fires
+        // StandToDeflectGuard4 on every press, HKS BEH_A_DEFLECT_GUARD_CONTINUE) is a transition
+        // too and fades by its TAE Blend; before, the pose snapped back to frame 0 on each press.
+        // The state clock only runs back on a new play (loops wrap inside clip_for). gap: the
+        // graph's self-transition is taken as its TaeBlend, like any other (not seen live: the
+        // recorder's anim field does not change on a replay).
+        let replayed = key == skel.shown && !a.anim.is_empty() && drawn + 1e-4 < skel.shown_t;
+        skel.shown_t = drawn;
+        if key != skel.shown || replayed {
+            skel.from = if skel.last.len() == skel.bones.len() { skel.last.clone() } else { skel.bones.iter().map(|&b| tfs.get(b).copied().unwrap_or_default()).collect() };
+            skel.from_tracked = skel.last_tracked.clone();
+            // Behavior-graph transitions all have duration 0 (c0000.hkx / c9997.hkx: TaeBlend*,
+            // DefaultTransition, StateToStateBlend): the blend time is the target anim's TAE Blend
+            // event, and an anim without one (hit / deflect / stagger reactions) snaps in at once.
+            // Locomotion is clip selection too (CMSGs; the only blenders in c0000.hkx are the
+            // master layer and the ledge hang), so a walk/run/idle switch blends by the shown
+            // clip's own TAE Blend (walk/run 6 frames, idle 9). CROSSFADE only for clips with no TAE.
+            let blend_len = if d.anim(&key).is_some() { d.blend_in(&key).unwrap_or(0.0) } else { CROSSFADE };
+            // From a settled clip the source plays on; from the middle of a fade, the frozen pose.
+            // (A blend summed from frame steps ends a hair under 1: the sprint's run-out switches
+            // clip on the very frame its blend completes, and faded each new clip from a frozen
+            // stride, the legs held apart while Wolf ran.)
+            skel.fade_src = if skel.blend >= 1.0 - 1e-3 { skel.shown_src.clone() } else { None };
+            let left = skel.yaw_off * (1.0 - skel.blend * skel.blend * (3.0 - 2.0 * skel.blend));
+            let jump = skel.yaw_seen.map_or(0.0, |y| (a.yaw - y + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI);
+            skel.yaw_off = if blend_len > 0.0 && jump.abs() > 0.5 && !crate::player::quick_turn_kind(&a.state).is_some_and(|(_, spins)| spins) { left - jump } else { 0.0 };
+            skel.blend = if skel.shown.is_empty() || blend_len <= 0.0 { 1.0 } else { 0.0 };
+            skel.blend_len = blend_len.max(1.0 / 60.0);
+            skel.upper_fade = skel.was_upper && a.state == "Locomotion";
+            skel.shown = key;
+        }
+        skel.was_upper = a.side == Side::Player && crate::player::is_upper_action(&a.state);
+        // On the character's own clock (the step advance just took): hit stop freezes the fade
+        // with the clip, as the exe runs it on the character's time (sekiro-rs fd53f99, MIT /
+        // Apache-2.0: blend length from TAE 16 / 17 at 140984230, smoothstep 141408650).
+        let step = (a.t - a.prev_t).max(0.0);
+        skel.blend = (skel.blend + step / skel.blend_len).min(1.0);
+        let w = skel.blend * skel.blend * (3.0 - 2.0 * skel.blend);
+        skel.shown_src = src_now;
+        skel.yaw_seen = Some(a.yaw);
+        let spin = if w < 1.0 && skel.yaw_off != 0.0 { Some(Quat::from_rotation_y(skel.yaw_off * (1.0 - w))) } else { None };
+        // The fade's source on its own clock: its pose this frame replaces the frozen one.
+        if w < 1.0 {
+            if let Some((key, st, loops)) = skel.fade_src.as_mut() {
+                *st += step;
+                if let Some(c) = l.clips.get(key.as_str()).filter(|c| c.frames > 0) {
+                    let ct = if *loops { c.wrap(*st) } else { *st };
+                    let f = (ct / c.frame_duration).clamp(0.0, (c.frames - 1) as f32);
+                    let (j0, kk) = (f.floor() as usize, f.fract());
+                    let j1 = (j0 + 1).min(c.frames - 1);
+                    let n = c.track_to_bone.len();
+                    if skel.from.len() == skel.bones.len() {
+                        for (track, &bone) in c.track_to_bone.iter().enumerate() {
+                            if let Some(slot) = usize::try_from(bone).ok().and_then(|b| skel.from.get_mut(b)) {
+                                let (p, q) = (&c.data[j0 * n + track], &c.data[j1 * n + track]);
+                                *slot = Transform { translation: p.translation.lerp(q.translation, kk), rotation: p.rotation.slerp(q.rotation, kk), scale: p.scale.lerp(q.scale, kk) };
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            skel.fade_src = None;
+        }
+        let f = (t / clip.frame_duration).clamp(0.0, (clip.frames - 1) as f32);
+        let (i0, k) = (f.floor() as usize, f.fract());
+        let i1 = (i0 + 1).min(clip.frames - 1);
+        // Additive layer (Actor.add_anim, HKS AddDamageBlend / AddDeflectGuardBlend): the clip holds
+        // per-bone deltas from identity (frame 0 is identity), multiplied onto the base pose.
+        let add = (!a.add_anim.is_empty()).then(|| l.clips.get(d.clip_key(&a.add_anim))).flatten().filter(|c| c.frames > 0).map(|c| {
+            let f = (a.add_t / c.frame_duration).clamp(0.0, (c.frames - 1) as f32);
+            let (j0, kk) = (f.floor() as usize, f.fract());
+            (c, j0, (j0 + 1).min(c.frames - 1), kk)
+        });
+        let mut add_delta: HashMap<usize, (Vec3, Quat)> = HashMap::new();
+        if let Some((c, j0, j1, kk)) = add {
+            let n = c.track_to_bone.len();
+            for (track, &bone) in c.track_to_bone.iter().enumerate() {
+                if bone >= 0 {
+                    let (p, q) = (&c.data[j0 * n + track], &c.data[j1 * n + track]);
+                    add_delta.insert(bone as usize, (p.translation.lerp(q.translation, kk), p.rotation.slerp(q.rotation, kk)));
+                }
+            }
+        }
+        // Upper actions (player::is_upper_action): the legs take the walk/run clip, on the
+        // action's clock (the loop continues from it when the action ends).
+        let lower = (a.side == Side::Player && crate::player::is_upper_action(&a.state))
+            .then(|| l.clips.get(&a.move_clip(false)))
+            .flatten()
+            .filter(|c| c.frames > 1)
+            .map(|c| {
+                let f = c.wrap(t) / c.frame_duration;
+                let (j0, kk) = ((f.floor() as usize).min(c.frames - 2), f.fract());
+                let mut track_of = vec![usize::MAX; skel.bones.len()];
+                for (track, &bone) in c.track_to_bone.iter().enumerate() {
+                    if let Some(slot) = usize::try_from(bone).ok().and_then(|b| track_of.get_mut(b)) {
+                        *slot = track;
+                    }
+                }
+                (c, j0, j0 + 1, kk, track_of)
+            });
+        // Bones the clip has no track for stay at the reference pose (as in Havok); resetting them
+        // every frame also stops per-frame layers (TAE 700 twists) from accumulating on them.
+        let mut tracked = vec![false; skel.bones.len()];
+        for &bone in &clip.track_to_bone {
+            if let Some(t) = usize::try_from(bone).ok().and_then(|b| tracked.get_mut(b)) {
+                *t = true;
+            }
+        }
+        skel.last_tracked.clone_from(&tracked);
+        for (bi, _) in tracked.iter().enumerate().filter(|(_, t)| !**t) {
+            if let (Some(def), Ok(mut tf)) = (l.bones.get(bi), tfs.get_mut(skel.bones[bi])) {
+                *tf = def.pose;
+            }
+            if let (Some(def), Some(slot)) = (l.bones.get(bi), skel.last.get_mut(bi)) {
+                *slot = def.pose;
+            }
+        }
+        for (track, &bone) in clip.track_to_bone.iter().enumerate() {
+            if bone < 0 || bone as usize >= skel.bones.len() {
+                continue;
+            }
+            let (p, q, k) = match &lower {
+                Some((c, j0, j1, kk, track_of)) if (bone as usize) < LOWER_BODY_BONES && track_of[bone as usize] != usize::MAX => {
+                    let (n, lt) = (c.track_to_bone.len(), track_of[bone as usize]);
+                    (&c.data[j0 * n + lt], &c.data[j1 * n + lt], *kk)
+                }
+                _ => (&clip.data[i0 * tracks + track], &clip.data[i1 * tracks + track], k),
+            };
+            let target = Transform {
+                translation: p.translation.lerp(q.translation, k),
+                rotation: p.rotation.slerp(q.rotation, k),
+                scale: p.scale.lerp(q.scale, k),
+            };
+            let bone = bone as usize;
+            let mut out = match skel.from.get(bone) {
+                // A bone the old clip had no track for takes the new clip at once: a Havok clip's
+                // pose carries no weight on its unbound bones, so the blend is all the new clip's
+                // there. Emma's left-hand sheath L_Saya (c7400): untracked in a000_003005, shown by
+                // a000_003004's TAE 713 from 0 s; faded from the reference pose it floated 0.3 m
+                // off her hand (the user, 2026-10-16). gap: the exe's per-bone blend weights are
+                // not traced.
+                Some(from) if w < 1.0 && !(skel.upper_fade && bone < LOWER_BODY_BONES) && skel.from_tracked.get(bone).copied().unwrap_or(true) => Transform {
+                    translation: from.translation.lerp(target.translation, w),
+                    rotation: from.rotation.slerp(target.rotation, w),
+                    scale: from.scale.lerp(target.scale, w),
+                },
+                _ => target,
+            };
+            if let Some(&(dt_, dq)) = add_delta.get(&bone) {
+                out.rotation = (out.rotation * dq).normalize();
+                out.translation += dt_;
+            }
+            if let Some(q) = spin.filter(|_| l.bones.get(bone).is_some_and(|b| b.parent < 0)) {
+                out.rotation = (q * out.rotation).normalize();
+                out.translation = q * out.translation;
+            }
+            if let Ok(mut tf) = tfs.get_mut(skel.bones[bone]) {
+                *tf = out;
+            }
+            if skel.last.len() != skel.bones.len() {
+                skel.last = vec![Transform::default(); skel.bones.len()];
+            }
+            skel.last[bone] = out;
+        }
+    }
+}
+
+/// Keeps this tick's pose (bones, then the root) for drawing, and updates the skeleton's
+/// GlobalTransforms by hand from the actor down (transform propagation runs only after Update),
+/// so FixedUpdate readers of bones and dummy polys see this tick (model.rs then moves the TAE 715
+/// weapon parts, as after the normal propagation). An actor off its due tick (Actor::lod) was not
+/// posed: its bones hold the drawn in-between pose, so its last pose is put back and kept (read as
+/// this tick's, the drawn pose flipped the window back and forth: the far enemies twitched).
+pub(crate) fn store_sim_poses(
+    mut commands: Commands,
+    mut actors: Query<(Entity, &Actor, &Transform, &mut GlobalTransform, &mut Skeleton, Has<SnapPose>)>,
+    mut nodes: Query<(&mut Transform, &mut GlobalTransform, Option<&Children>), Without<Actor>>,
+) {
+    let _prof = crate::perf::span("store_sim_poses");
+    let mut stack: Vec<(Entity, GlobalTransform)> = Vec::new();
+    for (e, a, tf, mut g, mut skel, snap) in &mut actors {
+        let bones: Vec<Entity> = skel.bones.iter().chain([&skel.root]).copied().collect();
+        if !a.lod_due && !snap && skel.sim[1].len() == bones.len() {
+            let mut moved = false;
+            for (&b, t) in bones.iter().zip(&skel.sim[1]) {
+                if let Ok((mut local, ..)) = nodes.get_mut(b) {
+                    moved |= local.set_if_neq(*t);
+                }
+            }
+            // Asleep and not drawn since its last tick: its bones and their globals are as left.
+            if !moved && *g == GlobalTransform::from(*tf) {
+                continue;
+            }
+        } else {
+            let now: Vec<Transform> = bones.iter().map(|&b| nodes.get(b).map(|n| *n.0).unwrap_or_default()).collect();
+            let prev = std::mem::replace(&mut skel.sim[1], now);
+            skel.sim[0] = if prev.len() == skel.sim[1].len() && !snap { prev } else { skel.sim[1].clone() };
+        }
+        if snap {
+            commands.entity(e).remove::<SnapPose>();
+        }
+        *g = GlobalTransform::from(*tf);
+        stack.push((skel.root, *g));
+        while let Some((e, parent)) = stack.pop() {
+            let Ok((local, mut global, children)) = nodes.get_mut(e) else { continue };
+            *global = parent.mul_transform(*local);
+            let here = *global;
+            stack.extend(children.into_iter().flat_map(|c| c.iter()).map(|c| (c, here)));
+        }
+    }
+}
+
+/// Draws each skeleton between its last two sim ticks' poses (interp.rs DrawAlpha; the latest
+/// pose without one), as the actors' capsules are.
+fn draw_poses(alpha: Option<Res<crate::interp::DrawAlpha>>, actors: Query<(&Actor, &Skeleton)>, mut tfs: Query<&mut Transform, Without<Actor>>) {
+    let _prof = crate::perf::span("draw_poses");
+    for (a, skel) in &actors {
+        // Asleep: its bones keep the latest sim pose.
+        if a.asleep() {
+            continue;
+        }
+        let k = alpha.as_ref().map_or(1.0, |al| crate::interp::draw_fraction(al.0.clamp(0.0, 1.0), a));
+        let [prev, cur] = &skel.sim;
+        for ((&e, p), c) in skel.bones.iter().chain([&skel.root]).zip(prev).zip(cur) {
+            // Written only when it differs: a changed bone is propagated again (and its cloth's
+            // bones with it, cloth.rs).
+            if let Ok(mut tf) = tfs.get_mut(e) {
+                tf.set_if_neq(Transform { translation: p.translation.lerp(c.translation, k), rotation: p.rotation.slerp(c.rotation, k), scale: p.scale.lerp(c.scale, k) });
+            }
+        }
+    }
+}
+
+/// Slides an absorbed character's model onto its capsule (ModelLag). Without one the root is
+/// held at rest every tick: the drawn (interpolated) root is read back as the sim pose, so the
+/// slide's last step used to leave a small offset for good (2026-10-12 bug hunt round 17).
+fn apply_model_lag(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut actors: Query<(Entity, &Transform, &Skeleton, Option<&mut ModelLag>, Has<SnapPose>), With<Actor>>,
+    mut roots: Query<&mut Transform, Without<Actor>>,
+) {
+    for (e, tf, skel, lag, snap) in &mut actors {
+        let Some(mut lag) = lag.filter(|_| !snap) else {
+            // Written only when it differs: a changed root re-propagates the whole skeleton.
+            let rest = Vec3::new(0.0, -CAPSULE_HALF_HEIGHT, 0.0);
+            if let Ok(mut r) = roots.get_mut(skel.root)
+                && r.translation != rest
+            {
+                r.translation = rest;
+            }
+            if snap {
+                commands.entity(e).remove::<ModelLag>();
+            }
+            continue;
+        };
+        lag.left -= time.delta_secs();
+        let k = (lag.left / lag.time.max(1e-6)).max(0.0);
+        if let Ok(mut r) = roots.get_mut(skel.root) {
+            r.translation = Vec3::new(0.0, -CAPSULE_HALF_HEIGHT, 0.0) + tf.rotation.inverse() * (lag.offset * k);
+        }
+        if lag.left <= 0.0 {
+            commands.entity(e).remove::<ModelLag>();
+        }
+    }
+}
+
+/// Bone lines, computed from local transforms (GlobalTransform lags a frame here).
+/// Wolf's foot IK (c0000.hkx hkbFootIkDriverInfo / hkbFootIkControlsModifier "FootIKControlsModifier",
+/// always on in the graph): each foot's ankle follows the ground under it, cast 0.8 m up and down
+/// (raycastDistanceUp / Down) on the collision, its offset from the ground under the body clamped
+/// to minAnkleHeightMS / maxAnkleHeightMS (-0.5 / 0.5) and eased by groundAscendingGain 0.2 /
+/// groundDescendingGain 1, faded in and out by onOffGain 0.2; the thigh and calf turn to put the
+/// ankle there in the knee's own plane (the graph's leg HandIK on L/R_Thigh, Calf, Foot), the foot
+/// keeps its animated turn. The pelvis drop is the exe's (FUN_140b3f920): toward clamp(the two
+/// feet's height difference, 0, TAE 944's limit) at 0.2 per 30 fps frame (DAT_143b01378,
+/// FUN_1407dc180), on RootPos, never while TAE flag 113 (HeightCorrection) is up; with no 944
+/// (standing, walking, running) it is 0. On the ground only, not hanging, swimming or on the wire.
+/// gaps: which 944 float goes with which foot, the sign of the exe's RootPos term (a drop here)
+/// and the ankle pitch / roll (ankleRotationGain 0.2, +-30 deg). Enemies whose behaviour carries
+/// foot IK ([`enemy_foot_ik`]) get the same, with their own values, cast on the detailed ground
+/// near Wolf ([`crate::terrain::Terrain::enemy_foot_floor`]). `SHINOBI_FOOT_IK=0` turns it off
+/// (to compare).
+#[allow(clippy::type_complexity)]
+fn foot_ik(
+    time: Res<Time>,
+    lib: Res<AnimLib>,
+    combat: Res<Combat>,
+    actors: Query<(Entity, &Actor, &Transform, &Skeleton, Option<&crate::player::Player>)>,
+    mut bones: Query<&mut Transform, Without<Actor>>,
+    mut state: Local<HashMap<Entity, FootIk>>,
+    mut ids: Local<HashMap<(usize, usize), Option<[usize; 7]>>>,
+) {
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SHINOBI_FOOT_IK").is_ok_and(|v| v == "0"));
+    if *OFF {
+        return;
+    }
+    let Some(terrain) = crate::terrain::terrain() else { return };
+    state.retain(|e, _| actors.contains(*e));
+    for (e, a, tf, skel, p) in &actors {
+        // Off its due tick (Actor::lod) it was not posed (apply_twists).
+        if !a.lod_due {
+            continue;
+        }
+        let dt = time.delta_secs() * a.lod.max(1) as f32;
+        let step = |gain: f32| 1.0 - (1.0 - gain).powf(dt * 30.0);
+        let setup = match p {
+            Some(_) => WOLF_FOOT_IK,
+            None => match combat.kinds.get(a.kind).and_then(|k| enemy_foot_ik(&k.foe.chr).or_else(|| enemy_foot_ik(&k.foe.anim_chr))) {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        let l = lib.lib(a);
+        // The body's root (Wolf's RootPos, the enemies' Root), then thigh, calf, foot of each leg;
+        // per skeleton.
+        let Some([root_pos, lt, lc, lf, rt, rc, rf]) = *ids.entry((std::ptr::from_ref(l) as usize, l.bones.len())).or_insert_with(|| {
+            let at = |n: &str| l.bones.iter().position(|b| b.name == n);
+            Some([at("RootPos").or_else(|| at("Root"))?, at("L_Thigh")?, at("L_Calf")?, at("L_Foot")?, at("R_Thigh")?, at("R_Calf")?, at("R_Foot")?])
+        }) else {
+            continue;
+        };
+        if skel.bones.len() < l.bones.len() {
+            continue;
+        }
+        let st = state.entry(e).or_default();
+        let on = !a.airborne && a.hp > 0.0 && a.lift_ground.is_none() && p.is_none_or(|p| p.dock.is_none() && p.swim.is_none() && p.wire.is_none());
+        st.weight += (f32::from(u8::from(on)) - st.weight) * step(setup.on_off);
+        if st.weight < 1e-3 {
+            st.offset = [0.0; 2];
+            st.drop = 0.0;
+            continue;
+        }
+        // Model space -> world: the actor, then the skeleton root, then the bone chain.
+        let Ok(root) = bones.get(skel.root).copied() else { continue };
+        let base = tf.mul_transform(root);
+        let global = |bones: &Query<&mut Transform, Without<Actor>>, i: usize| -> Option<Transform> {
+            let mut chain = vec![i];
+            while let Some(&j) = chain.last() {
+                match l.bones.get(j).map(|b| b.parent) {
+                    Some(p) if p >= 0 => chain.push(p as usize),
+                    _ => break,
+                }
+            }
+            chain.iter().rev().try_fold(base, |acc, &j| Some(acc.mul_transform(*bones.get(*skel.bones.get(j)?).ok()?)))
+        };
+        let ground = tf.translation.y - CAPSULE_HALF_HEIGHT;
+        // Each foot's ground offset, eased.
+        let mut want = [0.0f32; 2];
+        for (k, &foot) in [lf, rf].iter().enumerate() {
+            let Some(f) = global(&bones, foot) else { continue };
+            let (x, z, top) = (f.translation.x, f.translation.z, f.translation.y.max(ground) + setup.ray_up);
+            let hit = if p.is_some() { terrain.foot_floor(x, z, top) } else { terrain.enemy_foot_floor(x, z, top) };
+            let hit = hit.filter(|h| *h >= f.translation.y.min(ground) - setup.ray_down);
+            want[k] = hit.map_or(0.0, |h| (h - ground).clamp(setup.ankle_min, setup.ankle_max));
+        }
+        for k in 0..2 {
+            let gain = if want[k] > st.offset[k] { setup.ascending } else { setup.descending };
+            st.offset[k] += (want[k] - st.offset[k]) * step(gain);
+        }
+        // The pelvis drop (TAE 944's limits; none without one or under flag 113).
+        let data = crate::actor::data_for(&combat, a);
+        let limit = if a.anim.is_empty() || data.flag(&a.anim, a.t, 113) {
+            0.0
+        } else {
+            data.events_at(&a.anim, a.t).find(|ev| ev.kind == 944).map_or(0.0, |ev| {
+                let arg = |k: &str| ev.args.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                if st.offset[0] > st.offset[1] { arg("unk0") } else { arg("unk1") }
+            })
+        };
+        let target = (st.offset[0] - st.offset[1]).abs().clamp(0.0, limit);
+        st.drop += 0.2 * (target - st.drop) * (dt * 30.0).clamp(0.5, 2.0);
+        let (w, drop, offset) = (st.weight, st.drop, st.offset);
+        if drop > 1e-4
+            && let Some(&b) = skel.bones.get(root_pos)
+            && let Ok(mut t) = bones.get_mut(b)
+        {
+            t.translation.y -= drop * w;
+        }
+        for (k, (thigh, calf, foot)) in [(lt, lc, lf), (rt, rc, rf)].into_iter().enumerate() {
+            let (Some(h), Some(kn), Some(an)) = (global(&bones, thigh), global(&bones, calf), global(&bones, foot)) else { continue };
+            let parent = l.bones[thigh].parent;
+            let Some(pt) = (if parent >= 0 { global(&bones, parent as usize) } else { Some(base) }) else { continue };
+            // The ankle's target: its animated height over the body's ground, on the foot's ground.
+            let target = an.translation + Vec3::Y * ((offset[k] + drop) * w);
+            let Some((thigh_rot, calf_rot)) = two_bone(h.translation, kn.translation, an.translation, target) else { continue };
+            // New world turns -> locals: the thigh under its parent, the calf under the new thigh,
+            // the foot keeping its world turn under the new calf.
+            let thigh_g = thigh_rot * h.rotation;
+            let calf_g = calf_rot * thigh_rot * kn.rotation;
+            for (i, g, parent_g) in [(thigh, thigh_g, pt.rotation), (calf, calf_g, thigh_g), (foot, an.rotation, calf_g)] {
+                if let Some(&b) = skel.bones.get(i)
+                    && let Ok(mut t) = bones.get_mut(b)
+                {
+                    t.rotation = (parent_g.inverse() * g).normalize();
+                }
+            }
+        }
+    }
+}
+
+/// One behaviour's foot IK values: the hkbFootIkDriverInfo's ray lengths (raycastDistanceUp /
+/// Down) and ankle limits (minAnkleHeightMS / maxAnkleHeightMS), and the
+/// hkbFootIkControlsModifier's gains (groundAscendingGain, groundDescendingGain, onOffGain).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FootIkSetup {
+    pub ray_up: f32,
+    pub ray_down: f32,
+    pub ankle_min: f32,
+    pub ankle_max: f32,
+    pub ascending: f32,
+    pub descending: f32,
+    pub on_off: f32,
+}
+
+/// Wolf's (c0000.hkx).
+pub(crate) const WOLF_FOOT_IK: FootIkSetup = FootIkSetup { ray_up: 0.8, ray_down: 0.8, ankle_min: -0.5, ankle_max: 0.5, ascending: 0.2, descending: 1.0, on_off: 0.2 };
+
+/// An enemy's foot IK, from its behaviour (chr/c####.behbnd: Behaviors_c####.hkx's
+/// hkbFootIkControlsModifier, Characters_c####.hkx's hkbFootIkDriverInfo): the two-leg ones
+/// whose legs end in the Foot_Target chains, as Wolf's. None for the 27 without a driver info
+/// (c1000, the soldiers' c1200 family, most bosses' helpers ...), the two with a controls
+/// modifier only (c1040, c1140: no driver, no IK) and, for now, the four-legged c1100, c1150,
+/// c1370 and c5080 (toe and hand chains). Every one has `enable` 1 with no binding (always on),
+/// onOffGain 0.2 and groundDescendingGain 1.
+pub(crate) fn enemy_foot_ik(chr: &str) -> Option<FootIkSetup> {
+    // (raycastDistanceUp, raycastDistanceDown, minAnkleHeightMS, maxAnkleHeightMS,
+    //  groundAscendingGain, groundDescendingGain, onOffGain)
+    let (ray_up, ray_down, ankle_min, ankle_max, ascending, descending, on_off) = match chr {
+        "c1010" | "c1020" | "c1050" | "c1060" | "c1190" | "c1220" | "c1400" | "c1500" | "c1550" => (0.7, 0.7, -0.7, 0.7, 0.5, 1.0, 0.2),
+        "c1030" | "c1080" | "c1130" | "c1300" | "c1700" | "c5000" | "c5060" | "c5090" | "c5400" | "c7000" | "c7010" | "c7100" | "c7110" | "c7200" => (0.7, 0.7, -0.7, 0.7, 1.0, 1.0, 0.2),
+        "c1070" => (0.7, 1.2, -0.7, 0.7, 1.0, 1.0, 0.2),
+        "c1110" | "c1120" => (0.5, 0.5, -0.5, 0.5, 0.5, 1.0, 0.2),
+        "c1180" => (0.7, 1.2, -0.7, 0.7, 0.5, 1.0, 0.2),
+        "c1240" | "c1250" | "c1310" | "c1360" | "c1450" | "c1470" => (0.7, 0.7, -0.7, 0.7, 0.2, 1.0, 0.2),
+        "c1350" => (0.7, 1.0, -0.7, 0.7, 1.0, 1.0, 0.2),
+        "c5020" => (0.7, 1.2, -0.1, 0.7, 1.0, 1.0, 0.2),
+        "c5100" | "c7020" => (0.8, 2.0, -0.8, 0.8, 1.0, 1.0, 0.2),
+        "c7300" => (0.5, 0.8, -0.1, 0.7, 1.0, 1.0, 0.2),
+        "c7400" => (0.5, 0.8, -0.7, 0.7, 1.0, 1.0, 0.2),
+        _ => return None,
+    };
+    Some(FootIkSetup { ray_up, ray_down, ankle_min, ankle_max, ascending, descending, on_off })
+}
+
+/// Foot IK's per-character state: each foot's eased ground offset, the pelvis drop and the fade.
+#[derive(Default)]
+struct FootIk {
+    offset: [f32; 2],
+    drop: f32,
+    weight: f32,
+}
+
+/// A two-bone chain hip -> knee -> ankle turned so the ankle reaches `target` (as near as the
+/// leg's length lets), the knee bending in its own plane: the world rotations to put on the thigh
+/// and, after it, on the calf.
+fn two_bone(hip: Vec3, knee: Vec3, ankle: Vec3, target: Vec3) -> Option<(Quat, Quat)> {
+    let (l1, l2) = (hip.distance(knee), knee.distance(ankle));
+    if l1 < 1e-4 || l2 < 1e-4 || ankle.distance(target) < 1e-4 {
+        return None;
+    }
+    let to = target - hip;
+    let axis = to.normalize_or_zero();
+    // The knee's side of the hip -> target line, from the animated knee.
+    let side = (knee - hip).reject_from_normalized(axis).normalize_or_zero();
+    if axis == Vec3::ZERO || side == Vec3::ZERO {
+        return None;
+    }
+    let d = to.length().clamp((l1 - l2).abs() + 1e-3, l1 + l2 - 1e-3);
+    let a = (l1 * l1 - l2 * l2 + d * d) / (2.0 * d);
+    let knee_new = hip + axis * a + side * (l1 * l1 - a * a).max(0.0).sqrt();
+    let thigh = Quat::from_rotation_arc((knee - hip).normalize(), (knee_new - hip).normalize());
+    let ankle_moved = knee_new + thigh * (ankle - knee);
+    let calf = Quat::from_rotation_arc((ankle_moved - knee_new).normalize(), (hip + axis * d - knee_new).normalize());
+    Some((thigh, calf))
+}
+
+fn draw_skeletons(
+    lib: Res<AnimLib>,
+    actors: Query<(&Actor, &Skeleton, &Transform), Without<HasModel>>,
+    tfs: Query<&Transform, Without<Actor>>,
+    mut gizmos: Gizmos,
+) {
+    for (a, skel, actor_tf) in &actors {
+        let l = lib.lib(&a);
+        let root = actor_tf.mul_transform(Transform::from_xyz(0.0, -CAPSULE_HALF_HEIGHT, 0.0));
+        let mut world: Vec<Transform> = Vec::with_capacity(l.bones.len());
+        for (i, b) in l.bones.iter().enumerate() {
+            // An encounter swap can leave the old (shorter) skeleton for a frame.
+            let local = skel.bones.get(i).and_then(|&e| tfs.get(e).ok()).copied().unwrap_or(b.pose);
+            let parent = if b.parent >= 0 && (b.parent as usize) < i { world[b.parent as usize] } else { root };
+            world.push(parent.mul_transform(local));
+        }
+        let color = match a.side {
+            Side::Player => Color::srgb(0.95, 0.9, 0.8),
+            Side::Enemy => Color::srgb(1.0, 0.45, 0.35),
+        };
+        for (i, b) in l.bones.iter().enumerate() {
+            if b.parent >= 0 && !b.name.contains("Target") && !b.name.contains("Master") {
+                let p = b.parent as usize;
+                if l.bones[p].name.contains("Master") || l.bones[p].name.contains("Target") {
+                    continue;
+                }
+                gizmos.line(world[p].translation, world[i].translation, color);
+            }
+        }
+    }
+}
+
+/// Lower-body twist (c0000.hkx hkbTwistModifiers bound to TwistMasterAngle, set by the exe's
+/// WalkTwist from Actor::twist): TwistMaster turns the Master bone (the whole body) about the model
+/// Y axis, TwistRootRotYCancel turns Spine..Spine2 (bones 42-44) back by the same angle split over
+/// the chain, so the legs run along the move direction while the chest keeps facing the target.
+fn apply_walk_twist(lib: Res<AnimLib>, actors: Query<(&Actor, &Skeleton)>, mut bones: Query<&mut Transform, Without<Actor>>) {
+    for (a, skel) in &actors {
+        // Off its due tick (Actor::lod) it was not posed: store_sim_poses puts the last pose back.
+        if a.twist.abs() < 1e-4 || !a.lod_due {
+            continue;
+        }
+        let l = lib.lib(&a);
+        let find = |n: &str| l.bones.iter().position(|b| b.name == n);
+        let Some(master) = find("Master") else { continue };
+        // + = legs turned right (toward model +X; forward is -Z).
+        let r = Quat::from_rotation_y(-a.twist);
+        if let Some(Ok(mut t)) = skel.bones.get(master).map(|&e| bones.get_mut(e)) {
+            t.rotation = (r * t.rotation).normalize();
+            t.translation = r * t.translation;
+        }
+        let chain: Vec<usize> = ["Spine", "Spine1", "Spine2"].iter().filter_map(|n| find(n)).collect();
+        let cancel = Quat::from_rotation_y(a.twist / chain.len().max(1) as f32);
+        for &bi in &chain {
+            // Parent's model-space rotation from the current local transforms.
+            let mut pw = Quat::IDENTITY;
+            let mut p = l.bones[bi].parent;
+            while p >= 0 {
+                let Some(Ok(t)) = skel.bones.get(p as usize).map(|&e| bones.get(e)) else { break };
+                pw = t.rotation * pw;
+                p = l.bones[p as usize].parent;
+            }
+            if let Some(Ok(mut t)) = skel.bones.get(bi).map(|&e| bones.get_mut(e)) {
+                t.rotation = (pw.inverse() * cancel * pw * t.rotation).normalize();
+            }
+        }
+    }
+}
+
+/// TAE 700 CustomLookAtTwistModifier (c0000.hkx, combat_data "twists"): while the event runs,
+/// Wolf's upper body turns toward the target - the lock-on target (TargetType 3), for the Freeaim
+/// attack twists else the attack's auto-aim target - within the modifier's limits. ModifierID N uses the modifiers named "N_*"
+/// (0_Twist = 0_TwistUD + 0_TwistLR: +-25 deg up/down, +-45 deg left/right; 100-130_Attack:
+/// up 30-35 / down 25-35, no left/right). Each chain (TwistParam) gets `rate` of the angle,
+/// split evenly over the bones below `start` down to `end` (0_Twist: RootRotY..Spine2 30 %,
+/// Neck..Head 70 %), and eases toward it by onGain per 1/30 s frame (offGain back to 0 when
+/// the event ends). Applied as a world-space rotation about each bone (parent's GlobalTransform,
+/// one frame old).
+fn apply_twists(
+    time: Res<Time>,
+    lib: Res<AnimLib>,
+    combat: Res<Combat>,
+    lock: Option<Res<crate::view::LockOn>>,
+    actors: Query<(Entity, &Actor, &Transform, &Skeleton)>,
+    targets: Query<(Entity, &Transform, Has<crate::player::Player>), With<Actor>>,
+    globals: Query<&GlobalTransform>,
+    mut bones: Query<&mut Transform, Without<Actor>>,
+    mut state: Local<HashMap<(Entity, usize), (f32, f32)>>,
+    mut last_chains: Local<HashMap<Entity, Vec<(crate::data::TwistChain, [f32; 4])>>>,
+) {
+    let _prof = crate::perf::span("twists");
+    for (e, a, tf, skel) in &actors {
+        // Off its due tick (Actor::lod) it was not posed: store_sim_poses puts the last pose
+        // back. A due tick runs the level's ticks of time (as actor.rs `advance`).
+        if !a.lod_due {
+            continue;
+        }
+        let dt = time.delta_secs() * a.lod.max(1) as f32;
+        let step = |gain: f32| 1.0 - (1.0 - gain.clamp(0.0, 1.0)).powf(dt * 30.0);
+        let l = lib.lib(&a);
+        // The active TAE 700 event and its modifiers.
+        let data = crate::actor::data_for(&combat, &a);
+        let ev = if a.anim.is_empty() { None } else { data.events_at(&a.anim, a.t).find(|ev| ev.kind == 700) };
+        // ModifierID "0: 0_Twist" -> modifier number 0; Wolf's graph names it "0_Twist", the NPC
+        // graph (c9997) "00_Twist" (several modifiers may share a number: 02_Twist_Neck/_Spine).
+        let id = ev
+            .and_then(|ev| ev.args.get("ModifierID"))
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_i64().map(|n| n.to_string())))
+            .and_then(|s| s.split(':').next().and_then(|n| n.trim().parse::<i32>().ok()));
+        let table = if a.side == crate::actor::Side::Player { &combat.twists } else { &combat.data_of(&a).twists };
+        let mut mods: Vec<(&String, &crate::data::Twist)> = match id {
+            Some(n) => table.iter().filter(|(k, _)| k.split('_').next().and_then(|p| p.parse::<i32>().ok()) == Some(n)).collect(),
+            None => Vec::new(),
+        };
+        mods.sort_by(|x, y| x.0.cmp(y.0));
+        let mods: Vec<&crate::data::Twist> = mods.into_iter().map(|(_, t)| t).collect();
+        // Desired yaw (positive = right) and pitch (positive = up) toward the target: Wolf's lock
+        // target (else his homing target), an NPC's opponent - Wolf.
+        // TargetType "3: Lockon (PC)" (the idle / move twist) follows only the lock-on target: with
+        // none it stays straight (falling back to the auto-aim target made Wolf's chest swing side
+        // to side at an enemy behind him). Freeaim (the attack twists) also takes the auto-aim target.
+        let lock_only = ev.and_then(|ev| ev.args.get("TargetType")).and_then(|v| v.as_str()).is_some_and(|s| s.starts_with("3:"));
+        let target = if a.side == crate::actor::Side::Player {
+            let lock_t = lock.as_ref().and_then(|l| l.target);
+            if lock_only { lock_t } else { lock_t.or(a.homing) }.and_then(|t| targets.get(t).ok()).map(|(_, t, _)| t)
+        } else {
+            a.homing.and_then(|t| targets.get(t).ok()).map(|(_, t, _)| t).or_else(|| targets.iter().find(|(te, _, is_player)| *is_player && *te != e).map(|(_, t, _)| t))
+        };
+        // Each chain is clamped by its own modifier's limits (Wolf's 0_TwistLR turns, 0_TwistUD tilts).
+        let (mut raw_yaw, mut raw_pitch) = (0.0f32, 0.0f32);
+        if let (Some(t), false) = (target, mods.is_empty()) {
+            let d = t.translation - tf.translation;
+            let flat = d.with_y(0.0);
+            let fwd = a.forward();
+            let right = fwd.cross(Vec3::Y);
+            raw_yaw = f32::atan2(flat.dot(right), flat.dot(fwd));
+            raw_pitch = f32::atan2(d.y, flat.length().max(0.1));
+        }
+        // While a modifier runs its chains ease in by onGain; after it ends the last chains
+        // ease back to zero by their offGain.
+        let active = !mods.is_empty();
+        let chains: Vec<(crate::data::TwistChain, [f32; 4])> = if active {
+            let all: Vec<(crate::data::TwistChain, [f32; 4])> = mods
+                .iter()
+                .flat_map(|m| m.chains.iter().filter(|c| c.start >= 0 && c.end >= 0).map(|c| (c.clone(), [m.up, m.down, m.right, m.left])))
+                .collect();
+            last_chains.insert(e, all.clone());
+            all
+        } else {
+            last_chains.get(&e).cloned().unwrap_or_default()
+        };
+        for ci in 0..chains.len() {
+            let chain = chains.get(ci).map(|(c, _)| c);
+            let [up, down, right, left] = chains.get(ci).map_or([0.0; 4], |(_, l)| l.map(f32::to_radians));
+            let (want_yaw, want_pitch) = (raw_yaw.clamp(-left, right), raw_pitch.clamp(-down, up));
+            let cur = state.entry((e, ci)).or_insert((0.0, 0.0));
+            let (rate, gain) = match chain {
+                Some(c) if active => (c.rate, c.on_gain),
+                Some(c) => (0.0, c.off_gain),
+                None => (0.0, 0.05),
+            };
+            cur.0 += (want_yaw * rate - cur.0) * step(gain);
+            cur.1 += (want_pitch * rate - cur.1) * step(gain);
+            let (yaw, pitch) = *cur;
+            let Some(c) = chain else { continue };
+            if yaw.abs() < 1e-4 && pitch.abs() < 1e-4 {
+                continue;
+            }
+            // Bones from `end` up to (not including) `start`.
+            let mut path = Vec::new();
+            let mut b = c.end as i32;
+            while b >= 0 && b != c.start as i32 && path.len() < 32 {
+                path.push(b as usize);
+                b = l.bones.get(b as usize).map_or(-1, |bd| bd.parent as i32);
+            }
+            if b != c.start as i32 || path.is_empty() {
+                continue;
+            }
+            let n = path.len() as f32;
+            let fwd = a.forward();
+            let r = Quat::from_axis_angle(Vec3::Y, -yaw / n) * Quat::from_axis_angle(fwd.cross(Vec3::Y).normalize_or_zero(), pitch / n);
+            for &bi in path.iter().rev() {
+                let parent = l.bones[bi].parent;
+                let pw = if parent >= 0 {
+                    skel.bones.get(parent as usize).and_then(|&p| globals.get(p).ok()).map(|g| g.compute_transform().rotation)
+                } else {
+                    None
+                };
+                let Some(pw) = pw else { continue };
+                if let Some(Ok(mut t)) = skel.bones.get(bi).map(|&be| bones.get_mut(be)) {
+                    t.rotation = (pw.inverse() * r * pw * t.rotation).normalize();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    /// The move loops (c0000.hkx StandWalk/RunLoop CMSGs, a000_0002xx / 0005xx; a010 sheathed) repeat
+    /// frame 0 as their last frame, and each move start (0001xx / 0004xx) ends within a frame of its
+    /// loop's first frame. Looping the starts instead (as before) popped 50-105 deg every cycle.
+    #[test]
+    fn move_loops_are_seamless() {
+        let lib = super::load(&crate::paths::root().join("extracted/anim_c0000.bin"));
+        if lib.clips.is_empty() {
+            return;
+        }
+        let max_angle = |a: &super::Clip, fa: usize, b: &super::Clip, fb: usize| {
+            let n = a.track_to_bone.len();
+            (0..n).map(|t| a.data[fa * n + t].rotation.angle_between(b.data[fb * n + t].rotation).to_degrees()).fold(0.0f32, f32::max)
+        };
+        for k in ["a000_000000", "a000_000200", "a000_000201", "a000_000202", "a000_000203", "a000_000500", "a000_000501", "a000_000502", "a000_000503", "a010_000200", "a010_000500"] {
+            let c = &lib.clips[k];
+            let d = max_angle(c, c.frames - 1, c, 0);
+            assert!(d < 1.0, "{k}: last frame {d:.1} deg from the first");
+        }
+        for (start, lp) in [("a000_000100", "a000_000200"), ("a000_000400", "a000_000500"), ("a000_000402", "a000_000502"), ("a000_000403", "a000_000503")] {
+            let (a, b) = (&lib.clips[start], &lib.clips[lp]);
+            let d = max_angle(a, a.frames - 1, b, 0);
+            assert!(d < 12.0, "{start} ends {d:.1} deg from {lp}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sheath_probe {
+    /// Sheath bones: parents and whether idle / attack clips animate them.
+    #[test]
+    #[ignore]
+    fn sheath_bones() {
+        let lib = super::load(&crate::paths::root().join("extracted/anim_c0000.bin"));
+        let name = |i: i16| lib.bones.get(i as usize).map(|b| b.name.clone()).unwrap_or("-".into());
+        for (i, b) in lib.bones.iter().enumerate() {
+            if b.name.contains("heath") || b.name.contains("Weapon") {
+                let mut chain = vec![];
+                let mut p = b.parent;
+                while p >= 0 && chain.len() < 6 {
+                    chain.push(name(p));
+                    p = lib.bones[p as usize].parent;
+                }
+                println!("{i} {} <- {:?} pose t{:?} r{:?}", b.name, chain, b.pose.translation, b.pose.rotation);
+            }
+        }
+        for k in ["a000_000000", "a050_002000", "a050_300000", "a000_000400"] {
+            if let Some(c) = lib.clips.get(k) {
+                let tracked: Vec<String> = c.track_to_bone.iter().filter(|&&b| b >= 0).map(|&b| name(b)).filter(|n| n.contains("heath") || n.contains("Weapon")).collect();
+                println!("{k}: {tracked:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod proc_clip_tests {
+    use super::*;
+
+    /// A grouped enemy (anim set 2: the Ashina spear soldier's a200) waits in its own battle
+    /// idle, not the sword's a000_400000 (2026-10-12 round 23).
+    #[test]
+    fn a_grouped_enemy_idles_in_its_own_stance() {
+        let mut a = Actor::new(Side::Enemy, 100.0, 100.0, 0.0, 0);
+        a.anim_keys = Some(std::sync::Arc::new(["a000_400000", "a200_400000", "a000_008550"].iter().map(|s| s.to_string()).collect()));
+        a.anim_group = 2;
+        a.procedural("IdleBattle");
+        assert_eq!(a.proc_clip(0.0).0, "a200_400000");
+        a.procedural("PostureBroken");
+        assert_eq!(a.proc_clip(0.0).0, "a000_008550", "no grouped clip: the a000 one");
+        a.anim_group = 0;
+        a.procedural("IdleBattle");
+        assert_eq!(a.proc_clip(0.0).0, "a000_400000");
+    }
+}
+
+#[cfg(test)]
+mod foot_ik_tests {
+    use super::*;
+
+    /// The leg solve (foot_ik's two_bone): a foot raised 0.2 m onto a step reaches it, the knee
+    /// bends forward in its own plane, and the thigh and calf keep their lengths.
+    #[test]
+    fn a_raised_foot_reaches_the_step_with_the_knee_forward() {
+        let (hip, knee, ankle) = (Vec3::new(0.0, 0.9, 0.0), Vec3::new(0.0, 0.47, 0.05), Vec3::ZERO);
+        for target in [Vec3::new(0.0, 0.2, 0.0), Vec3::new(0.0, 0.05, -0.05)] {
+            let (thigh, calf) = two_bone(hip, knee, ankle, target).unwrap();
+            let knee2 = hip + thigh * (knee - hip);
+            let ankle2 = knee2 + calf * (thigh * (ankle - knee));
+            assert!(ankle2.distance(target) < 0.01, "{target}: ankle at {ankle2}");
+            assert!((knee2.distance(hip) - knee.distance(hip)).abs() < 1e-4);
+            assert!((ankle2.distance(knee2) - ankle.distance(knee)).abs() < 1e-4);
+            assert!(knee2.z > 0.0 && knee2.x.abs() < 1e-4, "knee {knee2}");
+        }
+        // Out of reach: the leg straightens toward it.
+        let (thigh, calf) = two_bone(hip, knee, ankle, Vec3::new(0.0, -1.0, 0.0)).unwrap();
+        let knee2 = hip + thigh * (knee - hip);
+        let ankle2 = knee2 + calf * (thigh * (ankle - knee));
+        assert!(ankle2.y < 0.0 && ankle2.x.abs() < 1e-3, "{ankle2}");
+    }
+
+    /// Enemies' foot IK comes from their behaviours: the Ashina soldier family (c1010) eases up at
+    /// 0.5 with 0.7 m rays, c1000 and the four-legged ones have none; each two-leg one's skeleton
+    /// has the leg chain the solve turns.
+    #[test]
+    fn enemy_foot_ik_follows_each_behaviour() {
+        let c1010 = enemy_foot_ik("c1010").unwrap();
+        assert_eq!((c1010.ray_up, c1010.ray_down, c1010.ankle_max, c1010.ascending), (0.7, 0.7, 0.7, 0.5));
+        assert_eq!(enemy_foot_ik("c5020").map(|s| s.ankle_min), Some(-0.1));
+        for none in ["c1000", "c1040", "c1100", "c1200", "c0000"] {
+            assert_eq!(enemy_foot_ik(none), None, "{none}");
+        }
+        let dir = crate::paths::root().join("extracted");
+        for chr in ["c1010", "c1050", "c1300", "c5000"] {
+            let path = dir.join(format!("anim_{chr}.bin"));
+            if !path.exists() {
+                continue;
+            }
+            let lib = load(&path);
+            for bone in ["Root", "L_Thigh", "L_Calf", "L_Foot", "R_Thigh", "R_Calf", "R_Foot"] {
+                assert!(lib.bones.iter().any(|b| b.name == bone), "{chr} {bone}");
+            }
+        }
+    }
+}

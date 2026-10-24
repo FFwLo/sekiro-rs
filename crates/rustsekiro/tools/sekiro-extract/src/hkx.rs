@@ -1,0 +1,1234 @@
+//! Havok 2016 tagfiles (TAG0) and type compendiums (TCM0), as used by
+//! Sekiro's behavior (.hkx in behbnd) and animation files (anibnd).
+//!
+//! Only what the exporter needs: type names, member offsets, and the item
+//! table (pointers, arrays and strings in DATA are stored as item indices).
+
+use std::collections::HashMap;
+
+use crate::bin::Reader;
+
+#[derive(Default, Clone)]
+pub struct Types {
+    pub names: Vec<String>,
+    pub parents: HashMap<usize, usize>,
+    pub members: HashMap<usize, Vec<(String, usize)>>,
+    /// Byte size of each type (TBDY flag 0x08: size, alignment), when the file states it.
+    pub sizes: HashMap<usize, usize>,
+}
+
+impl Types {
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+
+    /// Byte offset of a member, searching parent types too.
+    pub fn member_offset(&self, ty: usize, member: &str) -> Option<usize> {
+        let mut t = ty;
+        while t != 0 {
+            if let Some(m) = self.members.get(&t).and_then(|ms| ms.iter().find(|(n, _)| n == member)) {
+                return Some(m.1);
+            }
+            t = *self.parents.get(&t)?;
+        }
+        None
+    }
+}
+
+pub struct Item {
+    pub ty: usize,
+    pub offset: usize,
+    pub count: usize,
+}
+
+pub struct Tagfile<'a> {
+    pub d: &'a [u8],
+    pub types: Types,
+    pub data: usize,
+    pub items: Vec<Item>,
+}
+
+fn sections(d: &[u8], start: usize, end: usize) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut o = start;
+    while o + 8 <= end {
+        let size = (u32::from_be_bytes(d[o..o + 4].try_into().unwrap()) & 0x3FFF_FFFF) as usize;
+        if size < 8 {
+            break;
+        }
+        out.push((String::from_utf8_lossy(&d[o + 4..o + 8]).into_owned(), o + 8, o + size));
+        o += size;
+    }
+    out
+}
+
+fn section_map(d: &[u8]) -> HashMap<String, (usize, usize)> {
+    fn walk(d: &[u8], s: usize, e: usize, out: &mut HashMap<String, (usize, usize)>) {
+        for (tag, a, b) in sections(d, s, e) {
+            if matches!(tag.as_str(), "TAG0" | "TCM0" | "TYPE" | "INDX") {
+                walk(d, a, b, out);
+            }
+            out.insert(tag, (a, b));
+        }
+    }
+    let mut out = HashMap::new();
+    walk(d, 0, d.len(), &mut out);
+    out
+}
+
+fn varint(d: &[u8], o: &mut usize) -> usize {
+    let b = d[*o] as usize;
+    let (v, n) = if b < 0x80 {
+        (b, 1)
+    } else if b & 0xC0 == 0x80 {
+        (((b & 0x3F) << 8) | d[*o + 1] as usize, 2)
+    } else if b & 0xE0 == 0xC0 {
+        (((b & 0x1F) << 16) | (d[*o + 1] as usize) << 8 | d[*o + 2] as usize, 3)
+    } else if b & 0xF8 == 0xE0 {
+        (((b & 0x07) << 24) | (d[*o + 1] as usize) << 16 | (d[*o + 2] as usize) << 8 | d[*o + 3] as usize, 4)
+    } else if b & 0xF8 == 0xE8 {
+        // 5 bytes: 3 + 32 bits.
+        (((b & 0x07) << 32) | (u32::from_be_bytes(d[*o + 1..*o + 5].try_into().unwrap()) as usize), 5)
+    } else if b & 0xF8 == 0xF0 {
+        // 6 bytes: 3 + 40 bits.
+        let mut v = b & 0x07;
+        for k in 1..6 {
+            v = (v << 8) | d[*o + k] as usize;
+        }
+        (v, 6)
+    } else if b == 0xF8 {
+        // 8 bytes: 56 bits.
+        let mut v = 0;
+        for k in 1..8 {
+            v = (v << 8) | d[*o + k] as usize;
+        }
+        (v, 8)
+    } else if b == 0xF9 {
+        (u64::from_be_bytes(d[*o + 1..*o + 9].try_into().unwrap()) as usize, 9)
+    } else {
+        panic!("unsupported tagfile varint prefix {b:#x}");
+    };
+    *o += n;
+    v
+}
+
+fn strings(d: &[u8], s: Option<&(usize, usize)>) -> Vec<String> {
+    s.map(|&(a, b)| d[a..b].split(|&c| c == 0).map(|x| String::from_utf8_lossy(x).into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Parses the TYPE section of a tagfile or compendium.
+pub fn read_types(d: &[u8]) -> Types {
+    let s = section_map(d);
+    let tst = strings(d, s.get("TSTR").or(s.get("TST1")));
+    let fst = strings(d, s.get("FSTR").or(s.get("FST1")));
+    let mut t = Types::default();
+    let Some(&(a, _)) = s.get("TNA1") else { return t };
+    let mut o = a;
+    let n = varint(d, &mut o);
+    t.names.push(String::new());
+    for _ in 1..n {
+        let si = varint(d, &mut o);
+        let tc = varint(d, &mut o);
+        for _ in 0..tc {
+            varint(d, &mut o);
+            varint(d, &mut o);
+        }
+        t.names.push(tst.get(si).cloned().unwrap_or_default());
+    }
+    let Some(&(mut o, b)) = s.get("TBDY") else { return t };
+    while o < b {
+        let ti = varint(d, &mut o);
+        if ti == 0 {
+            continue;
+        }
+        let parent = varint(d, &mut o);
+        let flags = varint(d, &mut o);
+        t.parents.insert(ti, parent);
+        if flags & 0x01 != 0 { varint(d, &mut o); }
+        if flags & 0x02 != 0 { varint(d, &mut o); }
+        if flags & 0x04 != 0 { varint(d, &mut o); }
+        if flags & 0x08 != 0 {
+            let size = varint(d, &mut o);
+            varint(d, &mut o); // alignment
+            t.sizes.insert(ti, size);
+        }
+        if flags & 0x10 != 0 { varint(d, &mut o); }
+        if flags & 0x20 != 0 {
+            let count = varint(d, &mut o);
+            let mut ms = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = varint(d, &mut o);
+                varint(d, &mut o); // member flags
+                let offset = varint(d, &mut o);
+                varint(d, &mut o); // member type
+                ms.push((fst.get(name).cloned().unwrap_or_default(), offset));
+            }
+            t.members.insert(ti, ms);
+        }
+        if flags & 0x40 != 0 {
+            let count = varint(d, &mut o);
+            for _ in 0..count {
+                varint(d, &mut o);
+                varint(d, &mut o);
+            }
+        }
+        if flags & 0x80 != 0 { varint(d, &mut o); }
+    }
+    t
+}
+
+impl<'a> Tagfile<'a> {
+    /// `compendium` supplies the types when the file only has a TCRF reference.
+    pub fn new(d: &'a [u8], compendium: Option<&Types>) -> Self {
+        let s = section_map(d);
+        let types = if s.contains_key("TNA1") { read_types(d) } else { compendium.cloned().unwrap_or_default() };
+        let data = s["DATA"].0;
+        let (a, b) = s["ITEM"];
+        let r = Reader::new(d);
+        let items = (a..b)
+            .step_by(12)
+            .map(|k| Item { ty: (r.u32(k) & 0xFF_FFFF) as usize, offset: r.u32(k + 4) as usize, count: r.u32(k + 8) as usize })
+            .collect();
+        Self { d, types, data, items }
+    }
+
+    /// Every element of every item of the type (arrays expanded; stride = item span / count).
+    pub fn elements_of(&self, type_name: &str) -> Vec<usize> {
+        let Some(t) = self.types.index_of(type_name) else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, it) in self.items.iter().enumerate() {
+            if it.ty != t || it.count == 0 {
+                continue;
+            }
+            let next = self.items.iter().skip(i + 1).map(|n| n.offset).find(|&o| o > it.offset);
+            let stride = next.map(|n| (n - it.offset) / it.count).unwrap_or(0);
+            for k in 0..it.count {
+                out.push(self.data + it.offset + k * stride);
+            }
+        }
+        out
+    }
+
+    pub fn objects_of(&self, type_name: &str) -> Vec<usize> {
+        let Some(t) = self.types.index_of(type_name) else { return Vec::new() };
+        self.items.iter().filter(|i| i.ty == t).map(|i| self.data + i.offset).collect()
+    }
+
+    pub fn field(&self, type_name: &str, member: &str) -> usize {
+        let t = self.types.index_of(type_name).unwrap_or_else(|| panic!("no type {type_name}"));
+        self.types.member_offset(t, member).unwrap_or_else(|| panic!("no member {type_name}.{member}"))
+    }
+
+    /// (absolute offset, element count) of the item a pointer/array field refers to.
+    pub fn deref(&self, at: usize) -> Option<(usize, usize)> {
+        let idx = Reader::new(self.d).u64(at) as usize;
+        (idx != 0 && idx < self.items.len()).then(|| (self.data + self.items[idx].offset, self.items[idx].count))
+    }
+
+    /// (absolute offset, element count) of a hkRelArray member: a u32 item index (HKLib
+    /// ArrayFormatHandler ReadHkRelArray; the hknp convex shapes' vertices / faces / indices).
+    pub fn deref_rel(&self, at: usize) -> Option<(usize, usize)> {
+        let idx = Reader::new(self.d).u32(at) as usize;
+        (idx != 0 && idx < self.items.len()).then(|| (self.data + self.items[idx].offset, self.items[idx].count))
+    }
+
+    /// (type name, absolute offset) of the object a pointer field refers to.
+    pub fn deref_obj(&self, at: usize) -> Option<(String, usize)> {
+        let idx = Reader::new(self.d).u64(at) as usize;
+        (idx != 0 && idx < self.items.len()).then(|| (self.types.names[self.items[idx].ty].clone(), self.data + self.items[idx].offset))
+    }
+
+    /// A member of an object of the given type (searching parents), if the type has it.
+    pub fn try_field(&self, type_name: &str, member: &str) -> Option<usize> {
+        self.types.member_offset(self.types.index_of(type_name)?, member)
+    }
+
+    pub fn string(&self, at: usize) -> String {
+        self.deref(at)
+            .map(|(o, n)| String::from_utf8_lossy(&self.d[o..o + n]).trim_end_matches('\0').to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Behavior file: CustomManualSelectorGenerator name -> (animId, offsetType).
+pub fn cmsg_map(d: &[u8]) -> HashMap<String, (i32, i32)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "CustomManualSelectorGenerator";
+    if tf.types.index_of(ty).is_none() {
+        return HashMap::new();
+    }
+    let (name, anim, offset_type) = (tf.field(ty, "name"), tf.field(ty, "animId"), tf.field(ty, "offsetType"));
+    tf.objects_of(ty)
+        .into_iter()
+        .map(|o| {
+            let n = tf.string(o + name);
+            (n.trim_end_matches("_CMSG").to_string(), (r.i32(o + anim), r.i32(o + offset_type)))
+        })
+        .collect()
+}
+
+/// Each CustomManualSelectorGenerator's anim end: (name, animeEndEventType, endEvent id).
+pub fn cmsg_ends(d: &[u8]) -> Vec<(String, i32, i32)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "CustomManualSelectorGenerator";
+    if tf.types.index_of(ty).is_none() {
+        return Vec::new();
+    }
+    let (name, kind, end) = (tf.field(ty, "name"), tf.field(ty, "animeEndEventType"), tf.field(ty, "endEvent"));
+    tf.objects_of(ty).into_iter().map(|o| (tf.string(o + name), r.i32(o + kind), r.i32(o + end))).collect()
+}
+
+/// Transition effects: (type, name, duration, flags, endMode, blendCurve).
+pub fn transition_effects(d: &[u8]) -> Vec<(String, String, f32, u16, u8, u8)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let mut out = Vec::new();
+    for ty in ["hkbBlendingTransitionEffect", "CustomTransitionEffect"] {
+        if tf.types.index_of(ty).is_none() {
+            continue;
+        }
+        let f = |n: &str| tf.field(ty, n);
+        let (name, dur, flags, em, bc) = (f("name"), f("duration"), f("flags"), f("endMode"), f("blendCurve"));
+        for o in tf.objects_of(ty) {
+            out.push((ty.to_string(), tf.string(o + name), r.f32(o + dur), r.u16(o + flags), r.u8(o + em), r.u8(o + bc)));
+        }
+    }
+    out
+}
+
+/// Blender generators: name, blendParameter, flags, and children (generator type/name, weight),
+/// plus the behavior variables bound to the blender's members.
+pub fn blenders(d: &[u8]) -> Vec<String> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "hkbBlenderGenerator";
+    let mut out = Vec::new();
+    if tf.types.index_of(ty).is_none() {
+        return out;
+    }
+    // Variable names (hkbBehaviorGraphStringData.variableNames).
+    let var_names: Vec<String> = tf
+        .objects_of("hkbBehaviorGraphStringData")
+        .first()
+        .and_then(|&o| tf.deref(o + tf.field("hkbBehaviorGraphStringData", "variableNames")))
+        .map(|(a, n)| (0..n).map(|i| tf.string(a + i * 8)).collect())
+        .unwrap_or_default();
+    let name_of = |t: &str, o: usize| tf.try_field(t, "name").map(|f| tf.string(o + f)).unwrap_or_default();
+    for o in tf.objects_of(ty) {
+        let mut line = format!(
+            "{} blendParameter={} minCyclic={} maxCyclic={} flags={}",
+            name_of(ty, o),
+            r.f32(o + tf.field(ty, "blendParameter")),
+            r.f32(o + tf.field(ty, "minCyclicBlendParameter")),
+            r.f32(o + tf.field(ty, "maxCyclicBlendParameter")),
+            r.u16(o + tf.field(ty, "flags"))
+        );
+        if let Some((bs_ty, bs)) = tf.deref_obj(o + tf.field(ty, "variableBindingSet")) {
+            if let Some((a, n)) = tf.deref(bs + tf.field(&bs_ty, "bindings")) {
+                let bty = "hkbVariableBindingSet::Binding";
+                let (mp, vi) = (tf.field(bty, "memberPath"), tf.field(bty, "variableIndex"));
+                let size = tf.types.index_of(bty).map(|_| 40).unwrap_or(40);
+                for i in 0..n {
+                    let b = a + i * size;
+                    let v = r.i32(b + vi);
+                    line += &format!("
+    bind {} <- {}", tf.string(b + mp), var_names.get(v as usize).cloned().unwrap_or(v.to_string()));
+                }
+            }
+        }
+        if let Some((a, n)) = tf.deref(o + tf.field(ty, "children")) {
+            for i in 0..n {
+                if let Some((cty, c)) = tf.deref_obj(a + i * 8) {
+                    let w = r.f32(c + tf.field(&cty, "weight"));
+                    let generator = tf.deref_obj(c + tf.field(&cty, "generator")).map(|(gt, g)| format!("{gt} {}", name_of(&gt, g))).unwrap_or_default();
+                    line += &format!("
+    child weight={w} -> {generator}");
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Manual selector generators: name, the variable bound to selectedGeneratorIndex, and the
+/// children by index (generator type and name).
+pub fn selectors(d: &[u8]) -> Vec<String> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let mut out = Vec::new();
+    let var_names: Vec<String> = tf
+        .objects_of("hkbBehaviorGraphStringData")
+        .first()
+        .and_then(|&o| tf.deref(o + tf.field("hkbBehaviorGraphStringData", "variableNames")))
+        .map(|(a, n)| (0..n).map(|i| tf.string(a + i * 8)).collect())
+        .unwrap_or_default();
+    let name_of = |t: &str, o: usize| tf.try_field(t, "name").map(|f| tf.string(o + f)).unwrap_or_default();
+    for ty in ["hkbManualSelectorGenerator", "CustomManualSelectorGenerator"] {
+        if tf.types.index_of(ty).is_none() {
+            continue;
+        }
+        for o in tf.objects_of(ty) {
+            let mut line = format!("{ty} {}", name_of(ty, o));
+            if let Some((bs_ty, bs)) = tf.deref_obj(o + tf.field(ty, "variableBindingSet")) {
+                if let Some((a, n)) = tf.deref(bs + tf.field(&bs_ty, "bindings")) {
+                    let bty = "hkbVariableBindingSet::Binding";
+                    let (mp, vi) = (tf.field(bty, "memberPath"), tf.field(bty, "variableIndex"));
+                    for i in 0..n {
+                        let b = a + i * 40;
+                        let v = r.i32(b + vi);
+                        line += &format!("
+    bind {} <- {}", tf.string(b + mp), var_names.get(v as usize).cloned().unwrap_or(v.to_string()));
+                    }
+                }
+            }
+            if let Some(f) = tf.try_field(ty, "generators") {
+                if let Some((a, n)) = tf.deref(o + f) {
+                    for i in 0..n {
+                        let g = tf.deref_obj(a + i * 8).map(|(gt, g)| format!("{gt} {}", name_of(&gt, g))).unwrap_or_default();
+                        line += &format!("
+    [{i}] {g}");
+                    }
+                }
+            }
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Every object of `type_name`: its members (parents first) with the raw value read as
+/// i32 / f32, and the string when the member is a string item.
+pub fn objects(d: &[u8], type_name: &str) -> Vec<String> {
+    objects_with(d, None, type_name)
+}
+
+pub fn objects_with(d: &[u8], compendium: Option<&Types>, type_name: &str) -> Vec<String> {
+    let tf = Tagfile::new(d, compendium);
+    let r = Reader::new(d);
+    let Some(ty) = tf.types.index_of(type_name) else { return Vec::new() };
+    let mut chain = vec![ty];
+    while let Some(&p) = tf.types.parents.get(chain.last().unwrap()) {
+        if p == 0 {
+            break;
+        }
+        chain.push(p);
+    }
+    chain.reverse();
+    let mut out = Vec::new();
+    for o in tf.elements_of(type_name) {
+        let mut line = String::from(type_name);
+        for t in &chain {
+            for (name, off) in tf.types.members.get(t).cloned().unwrap_or_default() {
+                let (i, f) = (r.i32(o + off), r.f32(o + off));
+                let s = if name.to_lowercase().contains("name") { format!(" \"{}\"", tf.string(o + off)) } else { String::new() };
+                line += &format!("
+    {name}@{off:#x} = {i} / {f}{s}");
+                // Array / pointer items: element type, count and the raw words.
+                let idx = r.u64(o + off) as usize;
+                if name != "name" && idx != 0 && idx < tf.items.len() && tf.items[idx].count > 0 && i > 16 {
+                    let it = &tf.items[idx];
+                    let start = tf.data + it.offset;
+                    let words: Vec<String> = (0..(it.count * 4).min(32)).map(|k| {
+                        let (wi, wf) = (r.i32(start + k * 4), r.f32(start + k * 4));
+                        if wf.abs() > 1e-6 && wf.abs() < 1e6 { format!("{wf}") } else { format!("{wi}") }
+                    }).collect();
+                    line += &format!(" -> [{} x{}] {}", tf.types.names[it.ty], it.count, words.join(" "));
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// CustomLookAtTwistModifier (TAE 700 upper-body aim): name, limits [deg] (up, down, right, left)
+/// and the bone chains {startBoneIndex, endBoneIndex, targetRotationRate, newTargetGain, onGain,
+/// offGain} (CustomLookAtTwistModifier::TwistParam, 0x18 bytes).
+pub fn twist_modifiers(d: &[u8]) -> Vec<(String, [f32; 4], Vec<(i16, i16, f32, f32, f32, f32)>)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "CustomLookAtTwistModifier";
+    if tf.types.index_of(ty).is_none() {
+        return Vec::new();
+    }
+    let f = |n: &str| tf.field(ty, n);
+    let pt = "CustomLookAtTwistModifier::TwistParam";
+    let pf = |n: &str| tf.field(pt, n);
+    tf.objects_of(ty)
+        .into_iter()
+        .map(|o| {
+            let limits = [r.f32(o + f("UpLimitAngle")), r.f32(o + f("DownLimitAngle")), r.f32(o + f("RightLimitAngle")), r.f32(o + f("LeftLimitAngle"))];
+            let params = tf
+                .deref(o + f("twistParam"))
+                .map(|(a, n)| {
+                    (0..n)
+                        .map(|i| {
+                            let e = a + i * 0x18;
+                            (
+                                r.i16(e + pf("startBoneIndex")),
+                                r.i16(e + pf("endBoneIndex")),
+                                r.f32(e + pf("targetRotationRate")),
+                                r.f32(e + pf("newTargetGain")),
+                                r.f32(e + pf("onGain")),
+                                r.f32(e + pf("offGain")),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (tf.string(o + f("name")), limits, params)
+        })
+        .collect()
+}
+
+/// Twist modifiers of a shared NPC graph (c9997.hkx) with their character-property bindings
+/// resolved: hkbVariableBindingSet bindings of type 1 (character property) such as
+/// "twistParam:0/startBoneIndex" -> RefTwistNeckStart take the value at `variableIndex` in the
+/// character's hkbCharacterData.characterPropertyValues (`props`, raw 32-bit words).
+pub fn twist_modifiers_bound(d: &[u8], props: &[u32]) -> Vec<(String, [f32; 4], Vec<(i16, i16, f32, f32, f32, f32)>)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "CustomLookAtTwistModifier";
+    if tf.types.index_of(ty).is_none() {
+        return Vec::new();
+    }
+    let mut out = twist_modifiers(d);
+    let mut enabled = vec![true; out.len()];
+    let bt = "hkbVariableBindingSet::Binding";
+    for ((o, m), on) in tf.objects_of(ty).into_iter().zip(out.iter_mut()).zip(enabled.iter_mut()) {
+        *on = r.u8(o + tf.field(ty, "enable")) != 0;
+        let Some((_, set)) = tf.deref_obj(o + tf.field(ty, "variableBindingSet")) else { continue };
+        let Some((a, n, s)) = tf.array(set + tf.field("hkbVariableBindingSet", "bindings")) else { continue };
+        for i in 0..n {
+            let e = a + i * s;
+            if r.u8(e + tf.field(bt, "bindingType")) != 1 {
+                continue;
+            }
+            let Some(&word) = props.get(r.i32(e + tf.field(bt, "variableIndex")) as usize) else { continue };
+            let (int, float) = (word as i32, f32::from_bits(word));
+            let path = tf.string(e + tf.field(bt, "memberPath"));
+            match path.as_str() {
+                // RefTwistEnable / RefQuadrupedTwistEnable: off modifiers are dropped.
+                "enable" => *on = int != 0,
+                "UpLimitAngle" => m.1[0] = float,
+                "DownLimitAngle" => m.1[1] = float,
+                "RightLimitAngle" => m.1[2] = float,
+                "LeftLimitAngle" => m.1[3] = float,
+                p => {
+                    let Some((k, field)) = p.strip_prefix("twistParam:").and_then(|p| p.split_once('/')) else { continue };
+                    let Some(c) = k.parse::<usize>().ok().and_then(|k| m.2.get_mut(k)) else { continue };
+                    match field {
+                        "startBoneIndex" => c.0 = int as i16,
+                        "endBoneIndex" => c.1 = int as i16,
+                        "targetRotationRate" => c.2 = float,
+                        "newTargetGain" => c.3 = float,
+                        "onGain" => c.4 = float,
+                        "offGain" => c.5 = float,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out.into_iter().zip(enabled).filter(|(_, on)| *on).map(|(m, _)| m).collect()
+}
+
+/// Character properties of a character file (Characters\cXXXX.hkx, unpacked as
+/// Characters_cXXXX.hkx): names (hkbCharacterStringData.characterPropertyNames) and raw 32-bit
+/// values (hkbCharacterData.characterPropertyValues.wordVariableValues), in property order.
+pub fn character_properties(d: &[u8]) -> (Vec<String>, Vec<u32>) {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let cd = "hkbCharacterData";
+    let Some(&o) = tf.objects_of(cd).first() else { return (Vec::new(), Vec::new()) };
+    let words = tf
+        .deref_obj(o + tf.field(cd, "characterPropertyValues"))
+        .and_then(|(_, vs)| tf.deref(vs + tf.field("hkbVariableValueSet", "wordVariableValues")))
+        .map(|(a, n)| (0..n).map(|i| r.u32(a + i * 4)).collect())
+        .unwrap_or_default();
+    let names = tf
+        .deref_obj(o + tf.field(cd, "stringData"))
+        .and_then(|(_, sd)| tf.deref(sd + tf.field("hkbCharacterStringData", "characterPropertyNames")))
+        .map(|(a, n)| (0..n).map(|i| tf.string(a + i * 8)).collect())
+        .unwrap_or_default();
+    (names, words)
+}
+
+/// Behavior clip generators: (animationName, playbackSpeed, cropStart, cropEnd, startTime, enforcedDuration,
+/// mode). mode is hkbClipGenerator::PlaybackMode: 0 single play, 1 looping, 2 user controlled,
+/// 3 ping pong, 4 count.
+pub fn clip_generators(d: &[u8]) -> Vec<(String, f32, f32, f32, f32, f32, u8)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "hkbClipGenerator";
+    if tf.types.index_of(ty).is_none() {
+        return Vec::new();
+    }
+    let f = |n: &str| tf.field(ty, n);
+    let (name, speed, cs, ce, st, ed, mode) = (
+        f("animationName"),
+        f("playbackSpeed"),
+        f("cropStartAmountLocalTime"),
+        f("cropEndAmountLocalTime"),
+        f("startTime"),
+        f("enforcedDuration"),
+        f("mode"),
+    );
+    tf.objects_of(ty)
+        .into_iter()
+        .map(|o| (tf.string(o + name), r.f32(o + speed), r.f32(o + cs), r.f32(o + ce), r.f32(o + st), r.f32(o + ed), d[o + mode]))
+        .collect()
+}
+
+/// Animation file: (duration seconds, root motion samples [x, y, z, yaw]) if present.
+pub fn root_motion(d: &[u8], compendium: &Types) -> (Option<f32>, Vec<[f32; 4]>) {
+    let tf = Tagfile::new(d, Some(compendium));
+    let r = Reader::new(d);
+    let ty = "hkaDefaultAnimatedReferenceFrame";
+    let Some(&o) = tf.objects_of(ty).first() else {
+        let dur = tf.objects_of("hkaSplineCompressedAnimation").first().map(|&a| r.f32(a + tf.field("hkaAnimation", "duration")));
+        return (dur, Vec::new());
+    };
+    let dur = r.f32(o + tf.field(ty, "duration"));
+    let samples: Vec<[f32; 4]> = tf
+        .deref(o + tf.field(ty, "referenceFrameSamples"))
+        .map(|(a, n)| (0..n).map(|i| std::array::from_fn(|k| r.f32(a + i * 16 + k * 4))).collect())
+        .unwrap_or_default();
+    // The yaw (w) is kept as stored, seams included: a200_511200 (the Ochimusha's behind
+    // deathblow) goes +90 -> -180 deg in 5 frames, and live Wolf turns exactly so
+    // (rec_c1010_20261009 tick 1990-2002: +76 -> -189 deg), the Wolf - enemy yaw difference
+    // matching frame for frame (-4 -13 -16 -16 -12 -7 -2 +70 -173 -62 0). Taking the short way
+    // there left Wolf facing ~180 deg off mid-throw (the enemy "behind" him). (The sign is
+    // mirrored with X in export.rs.)
+    (Some(dur), samples)
+}
+
+
+pub struct Bone {
+    pub name: String,
+    pub parent: i16,
+    pub pose: crate::spline::Qs,
+}
+
+fn read_qs(r: &Reader, o: usize) -> crate::spline::Qs {
+    crate::spline::Qs {
+        t: [r.f32(o), r.f32(o + 4), r.f32(o + 8)],
+        r: [r.f32(o + 16), r.f32(o + 20), r.f32(o + 24), r.f32(o + 28)],
+        s: [r.f32(o + 32), r.f32(o + 36), r.f32(o + 40)],
+    }
+}
+
+/// skeleton.hkx: bones with parent index and reference pose.
+pub fn skeleton(d: &[u8], compendium: &Types) -> Vec<Bone> {
+    let tf = Tagfile::new(d, Some(compendium));
+    let r = Reader::new(d);
+    let ty = "hkaSkeleton";
+    let Some(&o) = tf.objects_of(ty).first() else { return Vec::new() };
+    let (parents, n) = tf.deref(o + tf.field(ty, "parentIndices")).unwrap_or((0, 0));
+    let (bones, _) = tf.deref(o + tf.field(ty, "bones")).unwrap_or((0, 0));
+    let (pose, _) = tf.deref(o + tf.field(ty, "referencePose")).unwrap_or((0, 0));
+    let name_off = tf.field("hkaBone", "name");
+    (0..n)
+        .map(|i| Bone {
+            name: tf.string(bones + i * 16 + name_off),
+            parent: r.u16(parents + i * 2) as i16,
+            pose: read_qs(&r, pose + i * 48),
+        })
+        .collect()
+}
+
+pub struct Clip {
+    pub frame_duration: f32,
+    pub frames: usize,
+    pub track_to_bone: Vec<i16>,
+    /// frames x tracks
+    pub samples: Vec<Vec<crate::spline::Qs>>,
+}
+
+/// Animation hkx: decoded spline animation plus its track -> bone binding.
+/// Animation hkx: the clip's length in seconds (hkaAnimation duration), without decoding it.
+pub fn clip_duration(d: &[u8], compendium: &Types) -> Option<f32> {
+    let tf = Tagfile::new(d, Some(compendium));
+    let &o = tf.objects_of("hkaSplineCompressedAnimation").first()?;
+    Some(Reader::new(d).f32(o + tf.field("hkaAnimation", "duration")))
+}
+
+pub fn clip(d: &[u8], compendium: &Types) -> Option<Clip> {
+    let tf = Tagfile::new(d, Some(compendium));
+    let r = Reader::new(d);
+    let ty = "hkaSplineCompressedAnimation";
+    let &o = tf.objects_of(ty).first()?;
+    let tracks = r.u32(o + tf.field("hkaAnimation", "numberOfTransformTracks")) as usize;
+    let frames = r.u32(o + tf.field(ty, "numFrames")) as usize;
+    let per_block = r.u32(o + tf.field(ty, "maxFramesPerBlock")) as usize;
+    let frame_duration = r.f32(o + tf.field(ty, "frameDuration"));
+    let (bo, nb) = tf.deref(o + tf.field(ty, "blockOffsets"))?;
+    let block_offsets: Vec<u32> = (0..nb).map(|i| r.u32(bo + i * 4)).collect();
+    let (data, len) = tf.deref(o + tf.field(ty, "data"))?;
+    let samples = crate::spline::sample(&d[data..data + len], &block_offsets, tracks, frames, per_block.max(1));
+    let track_to_bone = tf
+        .objects_of("hkaAnimationBinding")
+        .first()
+        .and_then(|&b| tf.deref(b + tf.field("hkaAnimationBinding", "transformTrackToBoneIndices")))
+        .map(|(a, n)| (0..n).map(|i| r.u16(a + i * 2) as i16).collect())
+        .unwrap_or_else(|| (0..tracks as i16).collect());
+    Some(Clip { frame_duration, frames, track_to_bone, samples })
+}
+
+/// Debug: every type that has items, with item counts and member offsets.
+pub fn dump(d: &[u8], compendium: Option<&Types>) {
+    let tf = Tagfile::new(d, compendium);
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for it in &tf.items {
+        *counts.entry(it.ty).or_default() += it.count.max(1);
+    }
+    let mut tys: Vec<_> = counts.into_iter().collect();
+    tys.sort();
+    for (t, n) in tys {
+        let name = tf.types.names.get(t).cloned().unwrap_or_default();
+        let mut members = Vec::new();
+        let mut cur = t;
+        while cur != 0 {
+            if let Some(ms) = tf.types.members.get(&cur) {
+                members.extend(ms.iter().map(|(m, o)| format!("{m}@{o}")));
+            }
+            match tf.types.parents.get(&cur) {
+                Some(&p) => cur = p,
+                None => break,
+            }
+        }
+        println!("{t:4} {name} x{n}: {}", members.join(" "));
+    }
+}
+
+/// One ragdoll body capsule: endpoints and radius in model space (bind pose).
+pub struct HitCapsule {
+    pub name: String,
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub radius: f32,
+}
+
+fn quat_rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    let t = [2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])];
+    [
+        v[0] + w * t[0] + (y * t[2] - z * t[1]),
+        v[1] + w * t[1] + (z * t[0] - x * t[2]),
+        v[2] + w * t[2] + (x * t[1] - y * t[0]),
+    ]
+}
+
+/// Character physics (chrbnd cXXXX.HKX): hknpRagdollData body capsules, the shapes
+/// FromSoftware uses as character hurtboxes, in Havok model space.
+pub fn ragdoll_capsules(d: &[u8]) -> Vec<HitCapsule> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let rd = "hknpRagdollData";
+    let Some(&o) = tf.objects_of(rd).first() else { return Vec::new() };
+    let bc = "hknpPhysicsSystemData::bodyCinfoWithAttachment";
+    let Some(bt) = tf.types.index_of(bc) else { return Vec::new() };
+    let Some((bodies, n)) = tf.deref(o + tf.field(rd, "bodyCinfos")) else { return Vec::new() };
+    let size = tf.items.iter().find(|it| it.ty == bt && it.count == n).map(|_| 0).unwrap_or(0);
+    let _ = size;
+    // Element stride: distance between consecutive bodyCinfo items in the array.
+    let stride = (tf.types.member_offset(bt, "attachedBody").unwrap_or(160) + 16 + 15) / 16 * 16;
+    let (f_shape, f_name, f_pos, f_rot) = (tf.field(bc, "shape"), tf.field(bc, "name"), tf.field(bc, "position"), tf.field(bc, "orientation"));
+    let cap = "hknpCapsuleShape";
+    let (f_a, f_b, f_r) = (tf.field(cap, "a"), tf.field(cap, "b"), tf.field(cap, "convexRadius"));
+    let mut out = Vec::new();
+    for i in 0..n {
+        let b = bodies + i * stride;
+        let Some((s, _)) = tf.deref(b + f_shape) else { continue };
+        let p = [r.f32(b + f_pos), r.f32(b + f_pos + 4), r.f32(b + f_pos + 8)];
+        let q = [r.f32(b + f_rot), r.f32(b + f_rot + 4), r.f32(b + f_rot + 8), r.f32(b + f_rot + 12)];
+        let local = |at: usize| [r.f32(s + at), r.f32(s + at + 4), r.f32(s + at + 8)];
+        let world = |v: [f32; 3]| {
+            let w = quat_rotate(q, v);
+            [w[0] + p[0], w[1] + p[1], w[2] + p[2]]
+        };
+        out.push(HitCapsule { name: tf.string(b + f_name), a: world(local(f_a)), b: world(local(f_b)), radius: r.f32(s + f_r) });
+    }
+    out
+}
+
+/// Rumble camera (other/default.rumblebnd camera_NNN.hkx): an uncompressed Havok
+/// animation; returns (duration, per-frame transforms of the first track as
+/// [tx, ty, tz, qx, qy, qz, qw]).
+pub fn rumble_cam(d: &[u8]) -> Option<(f32, Vec<[f32; 7]>)> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "hkaInterleavedUncompressedAnimation";
+    let &o = tf.objects_of(ty).first()?;
+    let duration = r.f32(o + tf.field("hkaAnimation", "duration"));
+    let tracks = (r.u32(o + tf.field("hkaAnimation", "numberOfTransformTracks")) as usize).max(1);
+    let (t, n) = tf.deref(o + tf.field(ty, "transforms"))?;
+    let frames = n / tracks;
+    Some((
+        duration,
+        (0..frames)
+            .map(|f| {
+                let a = t + f * tracks * 48;
+                [r.f32(a), r.f32(a + 4), r.f32(a + 8), r.f32(a + 16), r.f32(a + 20), r.f32(a + 24), r.f32(a + 28)]
+            })
+            .collect(),
+    ))
+}
+
+/// Layer generators: each hkbLayer's generator, weight, motion flag and boneWeights
+/// (the upper/lower body masks), as `index=weight` runs of the non-zero entries.
+pub fn layers(d: &[u8]) -> Vec<String> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let mut out = Vec::new();
+    let name_of = |t: &str, o: usize| tf.try_field(t, "name").map(|f| tf.string(o + f)).unwrap_or_default();
+    let ty = "hkbLayerGenerator";
+    if tf.types.index_of(ty).is_none() {
+        return out;
+    }
+    for o in tf.objects_of(ty) {
+        let mut line = name_of(ty, o);
+        if let Some((a, n)) = tf.deref(o + tf.field(ty, "layers")) {
+            for i in 0..n {
+                let Some((lty, l)) = tf.deref_obj(a + i * 8) else { continue };
+                let g = tf.deref_obj(l + tf.field(&lty, "generator")).map(|(gt, g)| format!("{gt} {}", name_of(&gt, g))).unwrap_or_default();
+                let fl = |m: &str| tf.try_field(&lty, m).map(|f| r.f32(l + f)).unwrap_or(f32::NAN);
+                let motion = tf.try_field(&lty, "useMotion").map(|f| d[l + f]).unwrap_or(0);
+                line += &format!("\n  [{i}] {g} weight={} fadeIn={} fadeOut={} useMotion={motion}", fl("weight"), fl("fadeInDuration"), fl("fadeOutDuration"));
+                if let Some((_, bw)) = tf.deref_obj(l + tf.field(&lty, "boneWeights")) {
+                    if let Some((wa, wn)) = tf.deref(bw + tf.field("hkbBoneWeightArray", "boneWeights")) {
+                        let w: Vec<String> = (0..wn).filter_map(|k| { let v = r.f32(wa + k * 4); (v != 0.0 || wn < 64).then(|| format!("{k}={v}/{:#x}", r.u32(wa + k * 4))) }).collect();
+                        line += &format!("\n      boneWeights x{wn}: {}", w.join(" "));
+                    }
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// State machines: name and each state's name, id and generator (type, name).
+pub fn state_machines(d: &[u8]) -> Vec<String> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let mut out = Vec::new();
+    let name_of = |t: &str, o: usize| tf.try_field(t, "name").map(|f| tf.string(o + f)).unwrap_or_default();
+    let ty = "hkbStateMachine";
+    for o in tf.objects_of(ty) {
+        let mut line = name_of(ty, o);
+        if let Some((a, n)) = tf.deref(o + tf.field(ty, "states")) {
+            for i in 0..n {
+                let Some((sty, s)) = tf.deref_obj(a + i * 8) else { continue };
+                let g = tf.deref_obj(s + tf.field(&sty, "generator")).map(|(gt, g)| format!("{gt} {}", name_of(&gt, g))).unwrap_or_default();
+                line += &format!("\n  {} id={} -> {g}", name_of(&sty, s), r.i32(s + tf.field(&sty, "stateId")));
+                line += &transition_list(&tf, &r, s + tf.field(&sty, "transitions"));
+            }
+        }
+        if let Some(f) = tf.try_field(ty, "wildcardTransitions") {
+            let w = transition_list(&tf, &r, o + f);
+            if !w.is_empty() {
+                line += &format!("\n  wildcard:{w}");
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// The whole behavior graph as JSON (the `behavior` command -> extracted/behavior_<chr>.json):
+/// the event and variable names (hkbBehaviorGraphStringData), every state machine (its states:
+/// id, name, generator "Type Name", transitions [event name, to state id]; the wildcard
+/// transitions), every hkbManualSelectorGenerator (the variable bound to selectedGeneratorIndex
+/// and its generators in order) and every CustomManualSelectorGenerator (animId, offsetType, its
+/// generators). The script fires events by name (`hkbFireEvent("W_X")`) and sets the selectors'
+/// variables (SetVariable), so this is what turns its decisions into states and clips.
+pub fn behavior_graph(d: &[u8]) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let sd = "hkbBehaviorGraphStringData";
+    let names = |member: &str| -> Vec<String> {
+        tf.objects_of(sd)
+            .first()
+            .and_then(|&o| tf.deref(o + tf.field(sd, member)))
+            .map(|(a, n)| (0..n).map(|i| tf.string(a + i * 8)).collect())
+            .unwrap_or_default()
+    };
+    let (events, variables) = (names("eventNames"), names("variableNames"));
+    let name_of = |t: &str, o: usize| tf.try_field(t, "name").map(|f| tf.string(o + f)).unwrap_or_default();
+    let gen_of = |at: usize| tf.deref_obj(at).map(|(gt, g)| format!("{gt} {}", name_of(&gt, g))).unwrap_or_default();
+    let event = |id: i32| events.get(id as usize).cloned().unwrap_or_else(|| id.to_string());
+    let transitions = |at: usize| -> Vec<Value> {
+        let Some((_, arr)) = tf.deref_obj(at) else { return Vec::new() };
+        let Some((a, n)) = tf.deref(arr + tf.field("hkbStateMachine::TransitionInfoArray", "transitions")) else { return Vec::new() };
+        let ti = "hkbStateMachine::TransitionInfo";
+        let f = |m: &str| tf.try_field(ti, m);
+        let (nested, flags, cond) = (f("toNestedStateId"), f("flags"), f("condition"));
+        // [event, to state, to nested state, flags (0x400 global wildcard: the parent switches to
+        // the state holding this machine first; 0x2000 the nested id is valid), has a condition]
+        (0..n)
+            .map(|i| {
+                let t = a + i * 72;
+                json!([event(r.i32(t + 48)), r.i32(t + 52), nested.map_or(-1, |o| r.i32(t + o)), flags.map_or(0, |o| r.u16(t + o)), cond.is_some_and(|o| r.u64(t + o) != 0)])
+            })
+            .collect()
+    };
+    let mut machines = Map::new();
+    let ty = "hkbStateMachine";
+    for o in tf.objects_of(ty) {
+        let mut states = Vec::new();
+        if let Some((a, n)) = tf.deref(o + tf.field(ty, "states")) {
+            for i in 0..n {
+                let Some((sty, s)) = tf.deref_obj(a + i * 8) else { continue };
+                states.push(json!({
+                    "id": r.i32(s + tf.field(&sty, "stateId")),
+                    "name": name_of(&sty, s),
+                    "gen": gen_of(s + tf.field(&sty, "generator")),
+                    "transitions": transitions(s + tf.field(&sty, "transitions")),
+                }));
+            }
+        }
+        let wildcard = tf.try_field(ty, "wildcardTransitions").map(|f| transitions(o + f)).unwrap_or_default();
+        machines.insert(name_of(ty, o), json!({ "states": states, "wildcard": wildcard }));
+    }
+    let gens = |ty: &str, o: usize| -> Vec<String> {
+        tf.try_field(ty, "generators").and_then(|f| tf.deref(o + f)).map(|(a, n)| (0..n).map(|i| gen_of(a + i * 8)).collect()).unwrap_or_default()
+    };
+    let bound = |ty: &str, o: usize, member: &str| -> Option<String> {
+        let (bs_ty, bs) = tf.deref_obj(o + tf.field(ty, "variableBindingSet"))?;
+        let (a, n) = tf.deref(bs + tf.field(&bs_ty, "bindings"))?;
+        let bty = "hkbVariableBindingSet::Binding";
+        let (mp, vi) = (tf.field(bty, "memberPath"), tf.field(bty, "variableIndex"));
+        (0..n).map(|i| a + i * 40).find(|&b| tf.string(b + mp) == member).map(|b| {
+            let v = r.i32(b + vi);
+            variables.get(v as usize).cloned().unwrap_or_else(|| v.to_string())
+        })
+    };
+    let mut selectors = Map::new();
+    let ty = "hkbManualSelectorGenerator";
+    if tf.types.index_of(ty).is_some() {
+        for o in tf.objects_of(ty) {
+            selectors.insert(name_of(ty, o), json!({ "var": bound(ty, o, "selectedGeneratorIndex"), "gens": gens(ty, o) }));
+        }
+    }
+    let mut cmsgs = Map::new();
+    let ty = "CustomManualSelectorGenerator";
+    if tf.types.index_of(ty).is_some() {
+        for o in tf.objects_of(ty) {
+            // Each clip generator's animationName (its own name can differ: "a070_400010_new").
+            let anims: Vec<String> = tf
+                .try_field(ty, "generators")
+                .and_then(|f| tf.deref(o + f))
+                .map(|(a, n)| {
+                    (0..n)
+                        .filter_map(|i| tf.deref_obj(a + i * 8))
+                        .filter_map(|(gt, g)| tf.try_field(&gt, "animationName").map(|f| tf.string(g + f)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            cmsgs.insert(name_of(ty, o), json!({ "anim_id": r.i32(o + tf.field(ty, "animId")), "offset_type": r.i32(o + tf.field(ty, "offsetType")), "gens": gens(ty, o), "anims": anims }));
+        }
+    }
+    json!({ "events": events, "variables": variables, "machines": machines, "selectors": selectors, "cmsgs": cmsgs })
+}
+
+/// A state's (or the machine's wildcard) transitions: " [ev <event id> -> <state id> <effect>]"
+/// (72-byte hkbStateMachine::TransitionInfo, transition effect pointer @32, eventId@48,
+/// toStateId@52); the effect is the named hkbBlendingTransitionEffect / CustomTransitionEffect
+/// (see `transition_effects` for its flags: 1 = ignore the from generator's world-from-model,
+/// "NoSrcMotion") or "-" when the transition has none.
+fn transition_list(tf: &Tagfile, r: &Reader, at: usize) -> String {
+    let Some((_, arr)) = tf.deref_obj(at) else { return String::new() };
+    let Some((a, n)) = tf.deref(arr + tf.field("hkbStateMachine::TransitionInfoArray", "transitions")) else { return String::new() };
+    (0..n)
+        .map(|i| {
+            let effect = tf.deref_obj(a + i * 72 + 32).and_then(|(t, o)| tf.try_field(&t, "name").map(|f| tf.string(o + f))).unwrap_or_else(|| "-".into());
+            format!(" [ev {} -> {} {effect}]", r.i32(a + i * 72 + 48), r.i32(a + i * 72 + 52))
+        })
+        .collect()
+}
+
+/// hkbTwistModifier objects: name, members (axis, bones, angle method) and variable bindings.
+pub fn twist_mods(d: &[u8]) -> Vec<String> {
+    let tf = Tagfile::new(d, None);
+    let r = Reader::new(d);
+    let ty = "hkbTwistModifier";
+    let mut out = Vec::new();
+    if tf.types.index_of(ty).is_none() {
+        return out;
+    }
+    let var_names: Vec<String> = tf
+        .objects_of("hkbBehaviorGraphStringData")
+        .first()
+        .and_then(|&o| tf.deref(o + tf.field("hkbBehaviorGraphStringData", "variableNames")))
+        .map(|(a, n)| (0..n).map(|i| tf.string(a + i * 8)).collect())
+        .unwrap_or_default();
+    let f = |m: &str| tf.try_field(ty, m);
+    for o in tf.objects_of(ty) {
+        let name = f("name").map(|x| tf.string(o + x)).unwrap_or_default();
+        let axis = f("axisOfRotation").map(|x| [r.f32(o + x), r.f32(o + x + 4), r.f32(o + x + 8)]).unwrap_or_default();
+        let mut line = format!(
+            "{name} axis={axis:?} twistAngle={} start={} end={} setAngle={} coords={} additive={} enable={}",
+            f("twistAngle").map(|x| r.f32(o + x)).unwrap_or(f32::NAN),
+            f("startBoneIndex").map(|x| r.u16(o + x) as i16).unwrap_or(-1),
+            f("endBoneIndex").map(|x| r.u16(o + x) as i16).unwrap_or(-1),
+            f("setAngleMethod").map(|x| d[o + x]).unwrap_or(255),
+            f("rotationAxisCoordinates").map(|x| d[o + x]).unwrap_or(255),
+            f("isAdditive").map(|x| d[o + x]).unwrap_or(255),
+            f("enable").map(|x| d[o + x]).unwrap_or(255),
+        );
+        if let Some((bs_ty, bs)) = tf.deref_obj(o + tf.field(ty, "variableBindingSet")) {
+            if let Some((a, n)) = tf.deref(bs + tf.field(&bs_ty, "bindings")) {
+                let bty = "hkbVariableBindingSet::Binding";
+                let (mp, vi) = (tf.field(bty, "memberPath"), tf.field(bty, "variableIndex"));
+                for i in 0..n {
+                    let b = a + i * 40;
+                    let v = r.i32(b + vi);
+                    line += &format!("\n    bind {} <- {}", tf.string(b + mp), var_names.get(v as usize).cloned().unwrap_or(v.to_string()));
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Map hit collision (`map/<id>/h<id>.hkxbhd` files, types from the binder's .compendium):
+/// every `fsnpCustomParamCompressedMeshShape` body of the `hknpPhysicsSystemData`, decoded to a
+/// triangle list in the file's own space (body transforms applied) with one FromSoftware hit
+/// material id per triangle (u32::MAX when unknown). Layout as in sekiro-rs
+/// `crates/formats/src/hknp.rs` (from DSMapStudio's HavokCollisionResource):
+/// - sections own a run of primitives (`primitives.data`: start >> 8, count & 0xFF) and packed
+///   vertices from `firstPackedVertex`; `sharedVertices.data & 0xFF` = packed count, `>> 8` =
+///   first entry in `sharedVerticesIndex`;
+/// - a primitive index below the packed count is a packed vertex (x 11, y 11, z 10 bits scaled
+///   by the section's codecParms: offset xyz, scale xyz), else a shared vertex through
+///   `sharedVerticesIndex` (x 21, y 21, z 22 bits over the tree's domain AABB);
+/// - (a, b, c, d) with c != d is a quad: (a, b, c) + (a, c, d); DE AD DE AD = a convex shape;
+/// - the material: `triangleIndexToShapeKey[i] >> (32 - numShapeKeyBits)` keyed as
+///   `(section << 8) | (primitive << 1) | second_triangle`, `pParam.triangleDataArray[i]
+///   .primitiveDataIndex` -> `primitiveDataArray[..].materialNameData`.
+pub struct CollisionMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub materials: Vec<u32>,
+}
+
+pub fn collision_mesh(d: &[u8], compendium: &Types) -> CollisionMesh {
+    let tf = Tagfile::new(d, Some(compendium));
+    let r = Reader::new(d);
+    let mut mesh = CollisionMesh { vertices: Vec::new(), indices: Vec::new(), materials: Vec::new() };
+    let f = |t: &str, m: &str| tf.field(t, m);
+    for sys in tf.objects_of("hknpPhysicsSystemData") {
+        let Some((bodies, nb, stride)) = tf.array(sys + f("hknpPhysicsSystemData", "bodyCinfos")) else { continue };
+        for bi in 0..nb {
+            let body = bodies + bi * stride;
+            let Some((shape_ty, shape)) = tf.deref_obj(body + f("hknpPhysicsSystemData::bodyCinfoWithAttachment", "shape")) else { continue };
+            let pos = [r.f32(body + 48), r.f32(body + 52), r.f32(body + 56)];
+            let q = [r.f32(body + 64), r.f32(body + 68), r.f32(body + 72), r.f32(body + 76)];
+            let ql = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt().max(1e-6);
+            let q = [q[0] / ql, q[1] / ql, q[2] / ql, q[3] / ql];
+            let part = if shape_ty.contains("CompressedMeshShape") {
+                decode_shape(&tf, &shape_ty, shape)
+            } else {
+                // Objects (objbnd hkx): hknpBoxShape / hknpConvexPolytopeShape (vertices +
+                // faces), hknpCapsuleShape / hknpSphereShape (1-2 vertices + convexRadius).
+                // The hit material: the body's hknpMaterial userData (HitMtrlParam id when
+                // set, else u32::MAX).
+                let mat_id = r.u16(body + f("hknpPhysicsSystemData::bodyCinfoWithAttachment", "materialId")) as usize;
+                let material = tf
+                    .array(sys + f("hknpPhysicsSystemData", "materials"))
+                    .filter(|&(_, n, _)| mat_id < n)
+                    .map(|(o, _, stride)| r.u64(o + mat_id * stride + f("hknpMaterial", "userData")) as u32)
+                    .filter(|&u| u != 0)
+                    .unwrap_or(u32::MAX);
+                decode_convex(&tf, &shape_ty, shape, material)
+            };
+            let base = mesh.vertices.len() as u32;
+            mesh.vertices.extend(part.vertices.iter().map(|v| {
+                let w = quat_rotate(q, *v);
+                [w[0] + pos[0], w[1] + pos[1], w[2] + pos[2]]
+            }));
+            mesh.indices.extend(part.indices.iter().map(|i| i + base));
+            mesh.materials.extend_from_slice(&part.materials);
+        }
+    }
+    mesh
+}
+
+/// A convex hknp shape as triangles: the polytope's faces (fans over `indices`), or for a
+/// capsule / sphere (no faces: the 1-2 `vertices` plus `convexRadius`) an 8-sided prism
+/// around the segment, extended by the radius at both ends.
+fn decode_convex(tf: &Tagfile, shape_ty: &str, shape: usize, material: u32) -> CollisionMesh {
+    let r = Reader::new(tf.d);
+    let mut mesh = CollisionMesh { vertices: Vec::new(), indices: Vec::new(), materials: Vec::new() };
+    let Some(vf) = tf.try_field(shape_ty, "vertices") else { return mesh };
+    let Some((vo, nv)) = tf.deref_rel(shape + vf) else { return mesh };
+    let verts: Vec<[f32; 3]> = (0..nv).map(|i| [r.f32(vo + i * 16), r.f32(vo + i * 16 + 4), r.f32(vo + i * 16 + 8)]).collect();
+    let radius = tf.try_field(shape_ty, "convexRadius").map(|o| r.f32(shape + o)).unwrap_or(0.0);
+    let faces = tf.try_field(shape_ty, "faces").and_then(|o| tf.deref_rel(shape + o));
+    let indices = tf.try_field(shape_ty, "indices").and_then(|o| tf.deref_rel(shape + o));
+    let mut tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        let base = mesh.vertices.len() as u32;
+        mesh.vertices.extend([a, b, c]);
+        mesh.indices.extend([base, base + 1, base + 2]);
+        mesh.materials.push(material);
+    };
+    match (faces, indices) {
+        (Some((fo, nf)), Some((io, ni))) if nf > 0 && nv >= 3 => {
+            // Face: u16 firstIndex, u8 numIndices, u8 minHalfAngle (4 bytes); indices u8.
+            for fi in 0..nf {
+                let first = r.u16(fo + fi * 4) as usize;
+                let n = r.u8(fo + fi * 4 + 2) as usize;
+                let idx: Vec<usize> = (0..n).filter(|k| first + k < ni).map(|k| r.u8(io + first + k) as usize).filter(|&v| v < nv).collect();
+                for k in 1..idx.len().saturating_sub(1) {
+                    tri(verts[idx[0]], verts[idx[k]], verts[idx[k + 1]]);
+                }
+            }
+        }
+        _ if (1..=2).contains(&nv) && radius > 0.0 => {
+            let a = verts[0];
+            let b = if nv == 2 { verts[1] } else { verts[0] };
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let axis = if l > 1e-6 { [d[0] / l, d[1] / l, d[2] / l] } else { [0.0, 1.0, 0.0] };
+            let seed = if axis[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+            let u = [axis[1] * seed[2] - axis[2] * seed[1], axis[2] * seed[0] - axis[0] * seed[2], axis[0] * seed[1] - axis[1] * seed[0]];
+            let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt().max(1e-6);
+            let u = [u[0] / ul, u[1] / ul, u[2] / ul];
+            let v = [axis[1] * u[2] - axis[2] * u[1], axis[2] * u[0] - axis[0] * u[2], axis[0] * u[1] - axis[1] * u[0]];
+            let a2 = [a[0] - axis[0] * radius, a[1] - axis[1] * radius, a[2] - axis[2] * radius];
+            let b2 = [b[0] + axis[0] * radius, b[1] + axis[1] * radius, b[2] + axis[2] * radius];
+            let ring = |c: [f32; 3], k: usize| {
+                let t = k as f32 * std::f32::consts::TAU / 8.0;
+                let (s, co) = t.sin_cos();
+                [c[0] + (u[0] * co + v[0] * s) * radius, c[1] + (u[1] * co + v[1] * s) * radius, c[2] + (u[2] * co + v[2] * s) * radius]
+            };
+            for k in 0..8 {
+                let (p0, p1, q0, q1) = (ring(a2, k), ring(a2, k + 1), ring(b2, k), ring(b2, k + 1));
+                tri(p0, q0, q1);
+                tri(p0, q1, p1);
+                tri(a2, p1, p0);
+                tri(b2, q0, q1);
+            }
+        }
+        _ => {}
+    }
+    mesh
+}
+
+fn decode_shape(tf: &Tagfile, shape_ty: &str, shape: usize) -> CollisionMesh {
+    let r = Reader::new(tf.d);
+    let mut mesh = CollisionMesh { vertices: Vec::new(), indices: Vec::new(), materials: Vec::new() };
+    let Some((_, data)) = tf.deref_obj(shape + tf.field("hknpCompressedMeshShape", "data")) else { return mesh };
+    // Material by shape key.
+    let mut materials: HashMap<u32, u32> = HashMap::new();
+    if let (Some(pparam_f), Some(keys_f)) = (tf.try_field(shape_ty, "pParam"), tf.try_field(shape_ty, "triangleIndexToShapeKey")) {
+        let bits = r.u8(shape + tf.field("hknpShape", "numShapeKeyBits")) as u32;
+        if let (Some((_, param)), Some((keys, nk, _)), true) = (tf.deref_obj(shape + pparam_f), tf.array(shape + keys_f), (1..=32).contains(&bits)) {
+            let prim_mats: Vec<u32> = tf
+                .array(param + tf.field("fsnpCustomMeshParameter", "primitiveDataArray"))
+                .map(|(o, n, s)| (0..n).map(|i| r.u32(o + i * s + tf.field("fsnpCustomMeshParameter::PrimitiveData", "materialNameData"))).collect())
+                .unwrap_or_default();
+            if let Some((tris, nt, ts)) = tf.array(param + tf.field("fsnpCustomMeshParameter", "triangleDataArray")) {
+                let pdi = tf.field("fsnpCustomMeshParameter::TriangleData", "primitiveDataIndex");
+                for i in 0..nt.min(nk) {
+                    let key = r.u32(keys + i * 4) >> (32 - bits);
+                    if let Some(&m) = prim_mats.get(r.u32(tris + i * ts + pdi) as usize) {
+                        materials.entry(key).or_insert(m);
+                    }
+                }
+            }
+        }
+    }
+    let tree = data + tf.field("hknpCompressedMeshShapeData", "meshTree");
+    let tree_f = |m: &str| tree + tf.field("hknpCompressedMeshShapeTree", m);
+    let domain = tree_f("domain");
+    let dmin = [r.f32(domain), r.f32(domain + 4), r.f32(domain + 8)];
+    let dmax = [r.f32(domain + 16), r.f32(domain + 20), r.f32(domain + 24)];
+    let shared_scale = [
+        (dmax[0] - dmin[0]) / ((1u32 << 21) - 1) as f32,
+        (dmax[1] - dmin[1]) / ((1u32 << 21) - 1) as f32,
+        (dmax[2] - dmin[2]) / ((1u32 << 22) - 1) as f32,
+    ];
+    let Some((prims, nprims, _)) = tf.array(tree_f("primitives")) else { return mesh };
+    let Some((packed, npacked, _)) = tf.array(tree_f("packedVertices")) else { return mesh };
+    let (shared, nshared) = tf.array(tree_f("sharedVertices")).map(|(o, n, _)| (o, n)).unwrap_or((0, 0));
+    let (shared_index, nshared_index) = tf.array(tree_f("sharedVerticesIndex")).map(|(o, n, _)| (o, n)).unwrap_or((0, 0));
+    let Some((sections, nsections, sstride)) = tf.array(tree_f("sections")) else { return mesh };
+    let sf = |m: &str| tf.field("hkcdStaticMeshTreeBase::Section", m);
+    for si in 0..nsections {
+        let sec = sections + si * sstride;
+        let codec: Vec<f32> = (0..6).map(|k| r.f32(sec + sf("codecParms") + k * 4)).collect();
+        let first_packed = r.u32(sec + sf("firstPackedVertex")) as usize;
+        let sv = r.u32(sec + sf("sharedVertices"));
+        let packed_count = (sv & 0xFF) as usize;
+        let shared_start = (sv >> 8) as usize;
+        let pr = r.u32(sec + sf("primitives"));
+        let prim_start = (pr >> 8) as usize;
+        let prim_count = (pr & 0xFF) as usize;
+        let vertex = |i: u8| -> Option<[f32; 3]> {
+            let i = i as usize;
+            if i < packed_count {
+                let k = first_packed + i;
+                if k >= npacked {
+                    return None;
+                }
+                let v = r.u32(packed + k * 4);
+                Some([
+                    (v & 0x7FF) as f32 * codec[3] + codec[0],
+                    ((v >> 11) & 0x7FF) as f32 * codec[4] + codec[1],
+                    ((v >> 22) & 0x3FF) as f32 * codec[5] + codec[2],
+                ])
+            } else {
+                let k = shared_start + i - packed_count;
+                if k >= nshared_index {
+                    return None;
+                }
+                let s = r.u16(shared_index + k * 2) as usize;
+                if s >= nshared {
+                    return None;
+                }
+                let v = r.u64(shared + s * 8);
+                Some([
+                    (v & 0x1F_FFFF) as f32 * shared_scale[0] + dmin[0],
+                    ((v >> 21) & 0x1F_FFFF) as f32 * shared_scale[1] + dmin[1],
+                    ((v >> 42) & 0x3F_FFFF) as f32 * shared_scale[2] + dmin[2],
+                ])
+            }
+        };
+        let mut welded = [u32::MAX; 256];
+        for p in 0..prim_count {
+            let k = prim_start + p;
+            if k >= nprims {
+                break;
+            }
+            let ix = &tf.d[prims + k * 4..prims + k * 4 + 4];
+            if ix == [0xDE, 0xAD, 0xDE, 0xAD] {
+                continue;
+            }
+            let mut index_of = |i: u8, mesh: &mut CollisionMesh| -> Option<u32> {
+                if welded[i as usize] == u32::MAX {
+                    welded[i as usize] = mesh.vertices.len() as u32;
+                    mesh.vertices.push(vertex(i)?);
+                }
+                Some(welded[i as usize])
+            };
+            let key = ((si as u32) << 8) | ((p as u32) << 1);
+            let (Some(a), Some(b), Some(c)) = (index_of(ix[0], &mut mesh), index_of(ix[1], &mut mesh), index_of(ix[2], &mut mesh)) else { continue };
+            mesh.indices.extend([a, b, c]);
+            mesh.materials.push(materials.get(&key).copied().unwrap_or(u32::MAX));
+            if ix[2] != ix[3] {
+                let Some(dd) = index_of(ix[3], &mut mesh) else { continue };
+                mesh.indices.extend([a, c, dd]);
+                mesh.materials.push(materials.get(&(key | 1)).copied().unwrap_or(u32::MAX));
+            }
+        }
+    }
+    mesh
+}
